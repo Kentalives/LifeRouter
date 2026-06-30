@@ -1,0 +1,63 @@
+# Omitted settings fall back to internal/config.DefaultConfig and can be
+# overridden with PTHFSERVICE_* environment variables.
+app:
+grid:
+  # Dimensions are grid cells; cellsizem converts cells to real-world meters.
+  cellsizem: 0.2
+  # Layers are raster image inputs, one per navigable floor.
+  layers:
+    - name: "0"
+      img: "./data/map.png"
+    - name: "1"
+      img: "./data/floor1.png"
+    - name: "2"
+      img: "./data/floor2.png"
+  portals:
+    # Portal coordinates are meters, ordered as [x, y]; traversalcost is the cross-floor penalty.
+    # Portals 0-1
+    - from: [1.2, 3.2]
+      fromlayer: 0
+      to: [1.2, 3.2]
+      tolayer: 1
+      traversalcost: 15
+      bidirectional: true
+    - from: [5.6, 9.4]
+      fromlayer: 0
+      to: [5.6, 9.4]
+      tolayer: 1
+      traversalcost: 15
+      bidirectional: true
+    - from: [20.4, 11.4]
+      fromlayer: 0
+      to: [20.4, 11.4]
+      tolayer: 1
+      traversalcost: 15
+      bidirectional: true
+    - from: [14.6, 1.6]
+      fromlayer: 0
+      to: [14.6, 1.6]
+      tolayer: 1
+      traversalcost: 15
+      bidirectional: true
+    # Portals 1-2
+    - from: [1.6, 11.8]
+      fromlayer: 1
+      to: [1.6, 11.8]
+      tolayer: 2
+      traversalcost: 15
+      bidirectional: true
+    - from: [21.2, 1.4]
+      fromlayer: 1
+      to: [21.2, 1.4]
+      tolayer: 2
+      traversalcost: 15
+      bidirectional: true
+  rows: 63
+  cols: 118
+  pxpercell: 10
+pathfinding:
+  freemoveheight: 2
+  agent:
+    debug: false
+  emergency:
+    debug: false

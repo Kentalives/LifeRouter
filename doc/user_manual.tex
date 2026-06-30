@@ -1,0 +1,1090 @@
+\documentclass[12pt,a4paper]{report}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[english]{babel}
+\usepackage{array}
+\usepackage{float}
+\usepackage{geometry}
+\usepackage{longtable}
+\usepackage{listings}
+\usepackage[hyphens]{url}
+\usepackage[hidelinks,breaklinks=true]{hyperref}
+
+\geometry{margin=2.5cm}
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{0.6em}
+\renewcommand{\arraystretch}{1.2}
+
+\lstset{
+  basicstyle=\small\ttfamily,
+  breaklines=true,
+  breakatwhitespace=false,
+  columns=fullflexible,
+  frame=single
+}
+
+\title{LifeRouter\\User Manual}
+\author{Kentalives}
+\date{June 2026}
+
+\begin{document}
+
+\pagenumbering{roman}
+\maketitle
+\setcounter{page}{2}
+\tableofcontents
+\clearpage
+\pagenumbering{arabic}
+
+\chapter{User Manual}
+
+This manual contains the information needed to use the public API of LifeRouter.
+ It is intended for developers who want to integrate the
+service from Go or from another process that can communicate through NATS. It
+does not describe the internal algorithmic details; those belong to the design
+documentation and the technical manual.
+
+\section{Prerequisites}
+
+Using the service requires an accessible NATS process, a rasterizable map
+configured as a grid, and external geotruth services that provide object
+information. Public API coordinates are expressed in meters as
+\texttt{[x, y, z]} triples. Conversion between meters and cells depends on
+\texttt{grid.cellsizem}; by default, one cell represents \texttt{0.2} meters.
+
+Agent identifiers received by the API must exist in geotruth. The service reads
+the agent's real position, computes a route on the grid, and publishes movement
+updates through the configured publishing dependency.
+
+\section{Installation and Configuration}
+
+This section describes how to start the service as a standalone process.
+Embedded execution from another Go program is described later in the API usage
+section.
+
+\subsection{Environment Preparation}
+
+The project is a Go module and requires a Go version compatible with the version
+declared in \texttt{go.mod}. Besides the service code, the installation needs a
+reachable NATS server, geotruth services that store and publish object
+positions, and the map images referenced by the configuration.
+
+Before starting the service, check these points:
+
+\begin{itemize}
+\item the NATS process is available at the configured URL;
+\item the map image paths exist from the execution directory;
+\item grid dimensions match the map that will be rasterized;
+\item agent identifiers and signaling nodes exist in geotruth;
+\item floor and portal configuration represents the real space.
+\end{itemize}
+
+\subsection{Build}
+
+The normal build is run from the repository root:
+
+\begin{lstlisting}
+make build
+\end{lstlisting}
+
+This target runs \texttt{go build} with the default \texttt{all} build tag. The
+Makefile keeps \texttt{MODULES} as an optional build-tag override for specific
+runs, for example:
+
+\begin{lstlisting}
+make build MODULES="tag1 tag2"
+\end{lstlisting}
+
+Ordinary builds should use \texttt{make build} without overrides.
+
+When Go dependencies change, update module metadata and the \texttt{vendor}
+directory:
+
+\begin{lstlisting}
+make deps
+\end{lstlisting}
+
+\subsection{Running as a Service}
+
+The executable loads configuration with \texttt{config.LoadConfig(nil)}, prepares
+default dependencies, initializes the rasterized world, opens the service NATS
+connection, and registers the dispatcher subjects. The default dependencies also
+create internal query and publish pools toward geotruth. The process keeps
+running until it receives a shutdown signal such as \texttt{SIGINT} or
+\texttt{SIGTERM}. At that point it closes active agent sessions, stops the
+emergency if one is running, drains the service NATS connection, and releases
+closeable dependency resources.
+
+After building, run the generated binary from a directory where
+\texttt{config/config.yaml} and the configured map paths are accessible:
+
+\begin{lstlisting}
+./LifeRouter
+\end{lstlisting}
+
+The standalone entry point reuses \texttt{embedded.DefaultDependencies}. That
+function creates separate internal NATS pools for geotruth queries and
+publishes, and creates a simulated external system for part of the domain data.
+For a real deployment, the integration should provide its own dependencies
+through embedded execution or through a service that wraps this module.
+
+\subsection{Configuration File}
+
+The standalone service reads \texttt{config/config.yaml}. Omitted fields use
+\texttt{DefaultConfig} values. Embedded calls, tools, or benchmarks can call
+\texttt{LoadConfig} with an explicit path to use another YAML file, for example a
+scenario configuration under \texttt{data/}. Keys can also be overridden with
+environment variables that start with \texttt{PTHFSERVICE}; dots in key paths
+become underscores. For example:
+
+\begin{lstlisting}
+PTHFSERVICE_APP_SERVERURL=nats://localhost:4222
+PTHFSERVICE_GRID_CELLSIZEM=0.2
+\end{lstlisting}
+
+The following example shows the main part of a configuration with multiple
+floors, rasterizable images, and portals:
+
+\begin{lstlisting}
+app:
+  serverurl: "nats://localhost:4222"
+  stderr: true
+
+grid:
+  cellsizem: 0.2
+  rows: 63
+  cols: 118
+  pxpercell: 10
+  wallauracells: 1
+  layers:
+    - name: "0"
+      img: "./data/map.png"
+    - name: "1"
+      img: "./data/floor1.png"
+  portals:
+    - from: [1.2, 3.2]
+      fromlayer: 0
+      to: [1.2, 3.2]
+      tolayer: 1
+      traversalcost: 15
+      bidirectional: true
+
+pathfinding:
+  freemoveheight: 2
+  agent:
+    debug: false
+    findpathhandlerworkers: 8
+    blockingwaithandlerworkers: 1024
+    movefmetershandlerworkers: 16
+  geotruth:
+    queryconnections: 8
+    publishconnections: 8
+  emergency:
+    debug: false
+\end{lstlisting}
+
+\subsection{Main Fields}
+
+The \texttt{app} group defines NATS connectivity and log output. The
+\texttt{serverurl} key contains the NATS server URL. The \texttt{stderr},
+\texttt{fileout}, and \texttt{logfile} keys control whether logs are written to
+standard error, to a file, or to both.
+
+The \texttt{grid} group defines the rasterized representation of the space.
+\texttt{rows} and \texttt{cols} are expressed in cells. \texttt{pxpercell}
+indicates how many image pixels correspond to one grid cell.
+\texttt{cellsizem} indicates how many meters one cell represents. Entries in
+\texttt{layers} bind each floor to an image, and entries in \texttt{portals}
+connect coordinates on different floors. Portal coordinates are expressed in
+meters, not cells; portal layer fields are integer indexes into the
+\texttt{layers} list.
+
+The \texttt{pathfinding} group contains routing parameters:
+
+\begin{itemize}
+\item \texttt{freemoveheight}: free height used for direct movement and floor
+queries;
+\item diagnostic and concurrency parameters: debug traces and worker limits for
+some agent NATS handlers;
+\item emergency parameters: lighting hysteresis and preferred-route width;
+\item agent parameters: vision radius and number of cells between real-position
+updates;
+\item geotruth parameters: number of internal NATS connections used for queries
+and publishes toward the external service.
+\end{itemize}
+
+Tune these values together with cell size and map scale.
+
+\section{Complete Configuration Reference}
+
+This reference summarizes the fields accepted by the YAML configuration file,
+either \texttt{config/config.yaml} or an explicit path. If a field is omitted,
+the service uses the value from \texttt{DefaultConfig}. Environment variables
+use the \texttt{PTHFSERVICE} prefix and replace dots with underscores. For
+example, \texttt{grid.cellsizem} can be overridden with
+\texttt{PTHFSERVICE\_GRID\_CELLSIZEM}.
+
+\subsection{\texttt{app}}
+
+\begin{description}
+\item[\texttt{serverurl}] Text containing the NATS server URL. The default is
+the local NATS default URL.
+\item[\texttt{stderr}] Boolean. If \texttt{true}, logs are written to standard
+error. The default is \texttt{true}.
+\item[\texttt{fileout}] Boolean. If \texttt{true}, logs are written to a file.
+The default is \texttt{false}.
+\item[\texttt{logfile}] Text containing the log file path when
+\texttt{fileout} is enabled. The default is an empty string.
+\end{description}
+
+\subsection{\texttt{grid}}
+
+\begin{description}
+\item[\texttt{layers}] List of floors. Each element has \texttt{name}, the
+external floor or region identifier, and \texttt{img}, the path of the image to
+rasterize. By default there is one floor named \texttt{0} with image
+\texttt{../../data/map.png}.
+\item[\texttt{rows}] Unsigned integer with the number of grid rows. The default
+is \texttt{61}.
+\item[\texttt{cols}] Unsigned integer with the number of grid columns. The
+default is \texttt{114}.
+\item[\texttt{pxpercell}] Decimal number of image pixels that correspond to one
+cell. The default is \texttt{10}.
+\item[\texttt{cellsizem}] Decimal number of meters represented by one cell. It
+must be greater than \texttt{0}. The default is \texttt{0.2}.
+\item[\texttt{wallauracells}] Integer number of margin cells around walls. It
+must be greater than or equal to \texttt{0}. The default is \texttt{1}.
+\end{description}
+
+\subsection{\texttt{grid.portals}}
+
+Each portal connects two coordinates on different floors. Coordinates are
+expressed in meters as \texttt{[x, y]} lists. The service converts them to cells
+using \texttt{grid.cellsizem}.
+
+\begin{description}
+\item[\texttt{from}] List \texttt{[x, y]} with the source coordinate in meters.
+\item[\texttt{fromlayer}] Integer index of the source layer in
+\texttt{grid.layers}.
+\item[\texttt{to}] List \texttt{[x, y]} with the destination coordinate in
+meters.
+\item[\texttt{tolayer}] Integer index of the destination layer in
+\texttt{grid.layers}.
+\item[\texttt{traversalcost}] Integer traversal cost for crossing the portal.
+\item[\texttt{bidirectional}] Boolean. If \texttt{true}, the portal can be used
+in both directions. If \texttt{false}, it is used only from source to
+destination.
+\end{description}
+
+No portal is defined by default.
+
+\subsection{\texttt{pathfinding}}
+
+\begin{description}
+\item[\texttt{freemoveheight}] Decimal free height, in meters, used for direct
+movement and floor queries. It must be greater than \texttt{0}. The default is
+\texttt{2}.
+\end{description}
+
+\subsection{\texttt{pathfinding.emergency}}
+
+\begin{description}
+\item[\texttt{lighthystheresis}] Integer cost hysteresis applied to emergency
+signaling. It must be greater than \texttt{0}. The default is \texttt{100}.
+\item[\texttt{priopathwidth}] Decimal width, in grid cells, of emergency
+preferred routes. It must be greater than \texttt{0}. The default is \texttt{1}.
+\item[\texttt{debug}] Boolean. If \texttt{true}, enables diagnostic output for
+emergency pathfinding. The default is \texttt{false}.
+\end{description}
+
+\subsection{\texttt{pathfinding.agent}}
+
+\begin{description}
+\item[\texttt{visionradiuscells}] Unsigned integer with the agent vision radius
+in cells. It must be greater than \texttt{0}. The default is \texttt{10}.
+\item[\texttt{cellsforrealupdate}] Integer number of cells the agent can move
+before updating its real position. It must be greater than \texttt{0}. The
+default is \texttt{5}.
+\item[\texttt{maxreusableworldlinkedfloors}] Unsigned integer with the maximum
+number of linked floors that can be reused in an agent world. The default is
+\texttt{2}.
+\item[\texttt{sparsevaluepagedirectory}] Boolean. Enables sparse storage for the
+agent value directory. The default is \texttt{false}.
+\item[\texttt{findpathhandlerworkers}] Integer maximum number of worker
+goroutines that can handle \texttt{AgentFindPath} NATS requests in parallel. The
+default is \texttt{GOMAXPROCS}.
+\item[\texttt{blockingwaithandlerworkers}] Integer maximum number of worker
+goroutines that can handle \texttt{BlockingWait} requests in parallel. The
+default is \texttt{1024}.
+\item[\texttt{movefmetershandlerworkers}] Integer maximum number of worker
+goroutines that can handle \texttt{MoveFMeters} requests in parallel. The
+default is \texttt{2 * GOMAXPROCS}.
+\item[\texttt{debug}] Boolean. If \texttt{true}, enables diagnostic output for
+agent pathfinding. The default is \texttt{false}.
+\end{description}
+
+These worker limits affect only the NATS handler layer. They do not change the
+pathfinding algorithm and do not parallelize the steps of a single agent. Orders
+for one communicator remain ordered by its internal protocol, while requests
+for different agents can be handled concurrently.
+
+\subsection{\texttt{pathfinding.geotruth}}
+
+\begin{description}
+\item[\texttt{queryconnections}] Integer number of NATS connections used
+internally for geotruth queries such as object data, local vision, and floor
+resolution. The default is \texttt{GOMAXPROCS}.
+\item[\texttt{publishconnections}] Integer number of NATS connections used
+internally to publish position updates to geotruth. The default is
+\texttt{GOMAXPROCS}.
+\end{description}
+
+These values do not change the NATS connection used by a public client to call
+the \texttt{pathfinding} API. They only affect internal traffic from the
+pathfinding service to geotruth. Increasing them can reduce contention when many
+agents query local vision and publish positions, but it also increases the
+number of connections and goroutines held by the process. Values lower than
+\texttt{1} are treated as one connection.
+
+\section{Using the Service From Go}
+
+The recommended public surface for Go integrations is formed by these packages:
+
+\begin{itemize}
+\item \texttt{embedded}
+\item \texttt{pkg/pathfinding}
+\item \texttt{pkg/emergency}
+\item \texttt{pkg/domain}
+\item \texttt{pkg/config}
+\item \texttt{pkg/subjects}
+\item \texttt{pkg/tuning}
+\end{itemize}
+
+\subsection{Embedded Execution}
+
+The \texttt{embedded} package starts the same dispatcher used by the executable,
+but inside the caller process. This option is useful in integrations, tests, and
+tools that want explicit control over the service lifecycle.
+
+\begin{lstlisting}[language=Go]
+ctx := context.Background()
+cfg := embedded.DefaultConfig()
+
+dep, err := embedded.DefaultDependencies(ctx, cfg)
+if err != nil {
+    return err
+}
+
+dispatcher, err := embedded.Run(ctx, cfg, dep)
+if err != nil {
+    return err
+}
+defer dispatcher.Shutdown()
+\end{lstlisting}
+
+\texttt{DefaultConfig} returns convenient local values. In a real integration,
+review at least the NATS URL, map image paths, grid dimensions, portals, and
+external dependencies. \texttt{DefaultDependencies} creates internal NATS pools
+for geotruth query and publishing, and uses a simulated external system. In a
+real deployment, provide implementations of \texttt{domain.ExternalSystem},
+\texttt{domain.GeoQuery}, and \texttt{domain.GeoPublish}. The
+\texttt{GeoPublish} implementation publishes position updates and returns a
+commit acknowledgement; the integrator remains responsible for releasing any
+external clients or connections created outside the default pools.
+
+To validate a local installation or integration, run:
+
+\begin{lstlisting}
+make test
+\end{lstlisting}
+
+This command runs the full suite and generates \texttt{coverage.out}, a local
+per-package coverage report. To measure code exercised by all tests in the
+module, including black-box and integration tests that execute other packages,
+run \texttt{make test-cover-full}. The corresponding profile is
+\texttt{coverage-full.out} and can be opened with \texttt{make cover-full-html}.
+
+\subsection{Agent Pathfinding}
+
+The \texttt{pkg/pathfinding} package provides a client over an existing NATS
+connection. The client does not own the connection; the caller remains
+responsible for closing it.
+
+\begin{lstlisting}[language=Go]
+pf := pathfinding.New(nc)
+goal := [3]float64{10.0, 4.0, 0.0}
+
+comm, err := pf.AgentFindPath(ctx, goal, "agent-1", 2.0, 0)
+if err != nil {
+    return err
+}
+
+if err := comm.MoveNCells(ctx, 5); err != nil {
+    return err
+}
+
+done, err := comm.BlockingWait()
+if err != nil {
+    return err
+}
+<-done
+
+if err := comm.ExitError(ctx); err != nil {
+    return err
+}
+\end{lstlisting}
+
+\texttt{AgentFindPath} starts adaptive routing toward the given goal.
+\texttt{defaultCellsPerSecondMovement} defines automatic speed in cells per
+second. A zero value leaves the session stopped until explicit movement commands
+arrive. \texttt{moveNSteps} requests an initial number of cells to move.
+
+To estimate the cost without moving the agent, use
+\texttt{AgentNaivePathCost}:
+
+\begin{lstlisting}[language=Go]
+cost, err := pf.AgentNaivePathCost(ctx, goal, "agent-1")
+\end{lstlisting}
+
+An active session returns an \texttt{AgentCommunicator}. It can change speed,
+pause, terminate, move by cells, move by meters, check whether the run is still
+moving, and query the terminal error. The terminal result remains available for
+a short interval after completion; after that time, or after another session for
+the same agent starts, it may no longer be available.
+
+\subsection{Subscribing to Route State}
+
+\texttt{AgentPathSub} observes route snapshots for an agent. The channel returns
+a map by floor: the key is the floor name and the value is a list of cell states
+encoded with \texttt{domain.CellState}.
+
+\begin{lstlisting}[language=Go]
+states, err := pf.AgentPathSub(ctx, "agent-1")
+if err != nil {
+    return err
+}
+
+for snapshot := range states {
+    _ = snapshot["0"]
+}
+\end{lstlisting}
+
+The channel closes when the service reports that the subscription has ended.
+On large maps, the service may transport one snapshot as several compressed NATS
+messages; \texttt{AgentPathSub} assembles those chunks before returning the map
+on the Go channel.
+
+\subsection{Emergency Routing}
+
+The \texttt{pkg/emergency} package controls the emergency flow field.
+\texttt{Start} receives a list of exits, expressed as meter coordinates, and
+optionally per-floor preference graphs.
+
+\begin{lstlisting}[language=Go]
+em := emergency.New(nc)
+goals := [][3]float64{
+    {1.0, 1.0, 0.0},
+}
+
+if err := em.Start(ctx, goals, nil, 2.0); err != nil {
+    return err
+}
+defer em.Stop(ctx)
+\end{lstlisting}
+
+Flow snapshots can be observed with \texttt{FlowSub}. Each cell returns a
+direction encoded with \texttt{domain.Direction}, including planar directions,
+diagonal directions, and transitions between floors.
+
+\begin{lstlisting}[language=Go]
+flows, err := em.FlowSub(ctx)
+if err != nil {
+    return err
+}
+
+for snapshot := range flows {
+    _ = snapshot["0"]
+}
+\end{lstlisting}
+
+As with agent route state, \texttt{FlowSub} hides the chunked transport used when
+the complete flow field is too large for one NATS message.
+
+\subsection{Rasterized Map Tuning}
+
+The \texttt{pkg/tuning} package helps inspect the grid generated from an image.
+It does not run pathfinding, but it lets users check dimensions, scale, and wall
+aura before using an image as a service map. Rasterization uses the same
+production path as the service: traversable zones must be encoded in the red
+channel, not only as visually light or grayscale areas.
+
+\begin{lstlisting}[language=Go]
+grid, err := tuning.TraversableImageRender(
+    "./data/map.png",
+    63,
+    118,
+    10,
+    1,
+)
+if err != nil {
+    return err
+}
+
+fmt.Println(grid)
+\end{lstlisting}
+
+For large grids, the same structure can open a temporary web visualization in
+the system browser:
+
+\begin{lstlisting}[language=Go]
+if err := grid.OpenVisualizer(); err != nil {
+    return err
+}
+\end{lstlisting}
+
+\section{Common Workflows}
+
+\subsection{Validate a Map Before Running It}
+
+Before starting the service with a new image, rasterize it with the same logic
+used by the service. This detects incorrect routes, wrong dimensions, walls too
+close to traversable space, or maps whose traversability information is not in
+the red channel.
+
+\begin{lstlisting}[language=Go]
+grid, err := tuning.TraversableImageRender(
+    "./data/map.png",
+    rows,
+    cols,
+    pxPerCell,
+    wallAuraCells,
+)
+if err != nil {
+    return err
+}
+fmt.Println(grid)
+\end{lstlisting}
+
+If the printed grid does not represent the space well, review
+\texttt{rows}, \texttt{cols}, \texttt{pxpercell}, \texttt{cellsizem}, and
+\texttt{wallauracells}. Also confirm that traversable pixels have enough red
+channel value to pass the internal rasterization threshold before starting route
+calculations.
+
+\subsection{Start an Agent Route}
+
+The basic flow requires the service to be active, NATS to be available, and the
+agent to exist in geotruth. The initial position is read from geotruth and the
+goal is supplied as a meter coordinate.
+
+\begin{lstlisting}[language=Go]
+pf := pathfinding.New(nc)
+goal := [3]float64{x, y, z}
+
+comm, err := pf.AgentFindPath(ctx, goal, agentID, 2.0, 0)
+if err != nil {
+    return err
+}
+\end{lstlisting}
+
+After starting the session, wait for completion and query the final result:
+
+\begin{lstlisting}[language=Go]
+done, err := comm.BlockingWait()
+if err != nil {
+    return err
+}
+<-done
+
+if err := comm.ExitError(ctx); err != nil {
+    return err
+}
+\end{lstlisting}
+
+If \texttt{ExitError} returns \texttt{nil}, the session ended without a domain
+error. Otherwise, interpret the error using the error-message section.
+
+\subsection{Control Agent Movement}
+
+When the initial speed is zero, the session is prepared but does not advance
+until it receives an explicit movement command. This mode is useful for
+step-by-step simulations or for synchronizing movement with another system.
+
+\begin{lstlisting}[language=Go]
+comm, err := pf.AgentFindPath(ctx, goal, agentID, 0, 0)
+if err != nil {
+    return err
+}
+
+if err := comm.MoveNCells(ctx, 5); err != nil {
+    return err
+}
+\end{lstlisting}
+
+Movement can also be requested in meters. The call blocks until the distance is
+consumed or the session ends:
+
+\begin{lstlisting}[language=Go]
+remaining, err := comm.MoveFMeters(ctx, 1.5)
+if err != nil {
+    return err
+}
+_ = remaining
+\end{lstlisting}
+
+To switch from manual mode to continuous movement, update the speed. A zero
+value pauses automatic movement without destroying the session:
+
+\begin{lstlisting}[language=Go]
+_ = comm.UpdateMovementSpeed(ctx, 3.0)
+_ = comm.Stop(ctx)
+_ = comm.Terminate(ctx)
+\end{lstlisting}
+
+\subsection{Observe an Agent Path}
+
+Path snapshots can be used to visualize the search state. Start the session,
+subscribe to the agent identifier, and process updates until the channel closes.
+
+\begin{lstlisting}[language=Go]
+updates, err := pf.AgentPathSub(ctx, agentID)
+if err != nil {
+    return err
+}
+
+for snapshot := range updates {
+    cellsByFloor := snapshot
+    _ = cellsByFloor
+}
+\end{lstlisting}
+
+Each snapshot is a map by floor. Cell values are interpreted using
+\texttt{domain.CellState}.
+For large maps, the Go API still yields one complete snapshot per iteration; the
+split into NATS messages matters only for direct NATS consumers.
+
+\subsection{Run an Emergency}
+
+The emergency flow starts by defining one or more exits in meters. Optionally,
+preference graphs can be supplied to favor specific routes per floor.
+
+\begin{lstlisting}[language=Go]
+em := emergency.New(nc)
+goals := [][3]float64{
+    {exitX, exitY, exitZ},
+}
+
+if err := em.Start(ctx, goals, routeGraphs, 2.0); err != nil {
+    return err
+}
+\end{lstlisting}
+
+While the emergency is active, subscribe to the flow field. The channel closes
+when the service reports that publishing has ended:
+
+\begin{lstlisting}[language=Go]
+flows, err := em.FlowSub(ctx)
+if err != nil {
+    return err
+}
+
+for snapshot := range flows {
+    directionsByFloor := snapshot
+    _ = directionsByFloor
+}
+\end{lstlisting}
+
+The Go channel yields complete per-floor maps. Transport chunking for large
+fields is handled by the \texttt{pkg/emergency} client.
+
+When the emergency situation ends, call \texttt{Stop} to stop computation and
+remove preferred routes from the grid. The operation is idempotent: if there is
+no active emergency, or if another call already started the stop, it returns
+success once the system is stopped.
+
+\begin{lstlisting}[language=Go]
+if err := em.Stop(ctx); err != nil {
+    return err
+}
+\end{lstlisting}
+
+\subsection{Use Multiple Floors}
+
+The previous flows also work in multi-floor spaces if the configuration includes
+the corresponding layers and portals. Public coordinates are still expressed as
+\texttt{[x, y, z]}; the \texttt{z} value relates the real position to geotruth
+regions and grid floors.
+
+For this case, verify that every floor has an image, portals connect traversable
+cells, and the external system knows the region heights. If any of these pieces
+is missing, a route that appears valid on one floor may fail when crossing to
+another.
+
+\section{NATS API}
+
+Integrations that do not use the Go wrappers can call NATS subjects directly.
+Request/reply calls return a JSON wrapper from the shared \texttt{messages}
+package:
+
+\begin{lstlisting}
+{
+  "ok": true,
+  "error": "",
+  "error_code": "",
+  "data": ...
+}
+\end{lstlisting}
+
+When \texttt{ok} is \texttt{false}, \texttt{error} contains the remote message
+and \texttt{error\_code} can contain a stable code for known cross-process
+errors. Go clients should prefer \texttt{messages.Data[T]} and
+\texttt{messages.Err} to decode responses. Local wrapper errors, such as the
+public operation or NATS request/response phase, are not transmitted in this
+JSON; they appear only in the error returned by the Go client.
+
+Go consumers that use NATS directly can import subject constants from
+\texttt{pkg/subjects}. Consumers in other languages can use the literal subject
+names shown below.
+
+\subsection{Agent Subjects}
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{|p{0.34\textwidth}|p{0.30\textwidth}|p{0.24\textwidth}|}
+\hline
+\textbf{Subject} & \textbf{Input} & \textbf{Output} \\
+\hline
+\texttt{pathfinding.}\newline\texttt{agent\_find\_path} &
+\texttt{AgentFindPath}\newline\texttt{Params} &
+communicator id \\
+\hline
+\texttt{pathfinding.}\newline\texttt{agent\_naive\_}\newline\texttt{path\_cost} &
+\texttt{AgentNaive}\newline\texttt{PathCostParams} &
+cost \\
+\hline
+\texttt{pathfinding.}\newline\texttt{agent\_path\_watch} &
+agent identifier &
+stream on reply subject \\
+\hline
+\end{tabular}
+\caption{NATS subjects for starting and observing agent pathfinding.}
+\end{table}
+
+\texttt{AgentFindPathParams} has this shape:
+
+\begin{lstlisting}
+{
+  "goal": [10.0, 4.0, 0.0],
+  "agentid": "agent-1",
+  "defaultcellspersecondmovement": 2.0,
+  "movensteps": 0
+}
+\end{lstlisting}
+
+\texttt{AgentNaivePathCostParams} uses \texttt{goal} and \texttt{agentid}. The
+path subscription receives the agent identifier:
+
+\begin{lstlisting}
+{"id": "..."}
+\end{lstlisting}
+
+The path subscription sends small messages to the reply subject:
+
+\begin{lstlisting}
+{
+  "done": false,
+  "cells": {
+    "0": [0, 1, 4, 5]
+  }
+}
+\end{lstlisting}
+
+\subsection{Agent Communicator Subjects}
+
+Operations on an active agent use the identifier returned by:
+
+\begin{lstlisting}
+pathfinding.agent_find_path
+\end{lstlisting}
+
+In the current implementation, this identifier is the agent identifier.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{|p{0.34\textwidth}|p{0.30\textwidth}|p{0.24\textwidth}|}
+\hline
+\textbf{Subject} & \textbf{Input} & \textbf{Output} \\
+\hline
+\texttt{agent\_comm.}\newline\texttt{update\_movement\_speed} &
+id and new speed &
+OK \\
+\hline
+\texttt{agent\_comm.}\newline\texttt{blocking\_wait} &
+id &
+notification on reply subject \\
+\hline
+\texttt{agent\_comm.}\newline\texttt{is\_moving} &
+id &
+boolean \\
+\hline
+\texttt{agent\_comm.}\newline\texttt{exit\_error} &
+id &
+OK or final error \\
+\hline
+\texttt{agent\_comm.}\newline\texttt{terminate} &
+id &
+OK \\
+\hline
+\texttt{agent\_comm.}\newline\texttt{stop} &
+id &
+OK \\
+\hline
+\texttt{agent\_comm.}\newline\texttt{move\_n\_cells} &
+id and cell count &
+OK \\
+\hline
+\texttt{agent\_comm.}\newline\texttt{move\_f\_meters} &
+id and distance in meters &
+remaining meters \\
+\hline
+\end{tabular}
+\caption{NATS subjects for controlling an agent session.}
+\end{table}
+
+The JSON bodies for these control subjects have these shapes:
+
+\begin{lstlisting}
+{"id": "..."}
+{"id": "...", "float": 2.0}
+{"id": "...", "n": 5}
+\end{lstlisting}
+
+The \texttt{float} field represents the new speed in
+\texttt{update\_movement\_speed} and the distance in meters in
+\texttt{move\_f\_meters}.
+
+\texttt{move\_f\_meters} blocks until the requested distance is consumed or the
+session ends. If the agent stopped before completing the distance, the response
+can indicate \newline \texttt{ErrAgentExitedWithMetersLeft}.
+
+\subsection{Emergency Subjects}
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{|p{0.34\textwidth}|p{0.30\textwidth}|p{0.24\textwidth}|}
+\hline
+\textbf{Subject} & \textbf{Input} & \textbf{Output} \\
+\hline
+\texttt{emergency.start} &
+\texttt{EmergencyPathParams} &
+OK \\
+\hline
+\texttt{emergency.stop} &
+no body &
+OK, also when no emergency was active \\
+\hline
+\texttt{emergency.}\newline\texttt{flow\_watch} &
+no body &
+stream on reply subject \\
+\hline
+\end{tabular}
+\caption{NATS subjects for controlling emergency routing.}
+\end{table}
+
+\texttt{EmergencyPathParams} includes exits, preference graphs, and update
+frequency:
+
+\begin{lstlisting}
+{
+  "goals": [[1.0, 1.0, 0.0]],
+  "preferencegraph": [],
+  "updatetickspersecond": 2.0
+}
+\end{lstlisting}
+
+\texttt{emergency.flow\_watch} messages use the same close criterion as agent
+path streams. For small fields, the format is:
+
+\begin{lstlisting}
+{
+  "done": false,
+  "cells": {
+    "0": [1, 3, 10]
+  }
+}
+\end{lstlisting}
+
+\subsection{Snapshot Messages in NATS Streams}
+
+\texttt{pathfinding.agent\_path\_watch} and \texttt{emergency.flow\_watch} share
+the same snapshot stream format. Go wrapper users do not need to handle this
+format directly, but direct NATS consumers in other languages must accept two
+valid message shapes.
+The first shape is the small-message envelope preserved from the original
+contract:
+
+\begin{lstlisting}
+{
+  "done": false,
+  "cells": {
+    "0": [0, 1, 4, 5]
+  }
+}
+\end{lstlisting}
+
+The second shape is used when the full snapshot is too large for one NATS
+message. Each message carries one compressed chunk:
+
+\begin{lstlisting}
+{
+  "encoding": "gzip+json",
+  "snapshotId": "42",
+  "chunkIndex": 0,
+  "chunkCount": 3,
+  "data": "..."
+}
+\end{lstlisting}
+
+Consumers must group chunks by \texttt{snapshotId}, order them by
+\texttt{chunkIndex}, base64-decode each \texttt{data} field, concatenate the
+resulting bytes, decompress the result with \texttt{gzip}, and decode the JSON as
+a map by floor. The stream ends when this message arrives:
+
+\begin{lstlisting}
+{"done": true}
+\end{lstlisting}
+
+This chunking avoids requiring a larger NATS maximum payload. Default NATS
+configurations commonly limit one message to about 1 MiB.
+
+\section{Domain Types}
+
+Costs use \texttt{domain.Cost}. \texttt{COST\_EMPTY\_SPACE} represents normal
+movement cost and \newline \texttt{COST\_UNREACHABLE} represents an unreachable cell.
+
+Route visualization states use \texttt{domain.CellState}:
+
+\begin{itemize}
+\item \texttt{STATE\_Unvisited}
+\item \texttt{STATE\_Queued}
+\item \texttt{STATE\_Expanded}
+\item \texttt{STATE\_Inconsistent}
+\item \texttt{STATE\_OnPath}
+\item \texttt{STATE\_Obstacle}
+\end{itemize}
+
+Emergency directions use \texttt{domain.Direction}. In addition to the eight
+planar directions, \texttt{DIR\_IN} and \texttt{DIR\_OUT} represent transitions
+between floors, and \texttt{DIR\_UNKNOWN} means no direction is defined.
+
+Emergency preference graphs use \texttt{domain.RouteGraph}. Each graph contains
+a floor index, a list of \texttt{GraphWaypoint}, and a list of
+\texttt{GraphEdge}. Waypoints use real-world meter coordinates. Graphs do not
+replace the rasterized map; they modify costs to favor specific routes. If an
+edge omits \texttt{Weight}, the service treats it as weight \texttt{1}.
+
+\section{Common Error Messages}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{|p{0.36\textwidth}|p{0.55\textwidth}|}
+\hline
+\textbf{Error} & \textbf{Meaning for the user} \\
+\hline
+\texttt{ErrAgentCommNotFound} &
+There is no active or recently completed session with the given identifier. \\
+\hline
+\texttt{ErrAgentNoPath} &
+The service could not find a possible route to the goal. \\
+\hline
+\texttt{ErrAgentStillRunning} &
+The final error was queried while the session was still running. \\
+\hline
+\texttt{ErrAgentTerminated} &
+The session was explicitly terminated. \\
+\hline
+\texttt{ErrAgentExitedWithMetersLeft} &
+The meter movement command could not be completed because the session ended
+first. \\
+\hline
+\texttt{ErrEmergencyStillRunning} &
+An emergency was started while another emergency was already active. \\
+\hline
+\texttt{ErrDispatcherShuttingDown} &
+The service is shutting down and no longer accepts new sessions. \\
+\hline
+\end{tabular}
+\caption{Main public API errors.}
+\end{table}
+
+Besides these domain errors, a response can fail because of NATS connectivity,
+invalid JSON, coordinates outside the grid, or unavailable external geotruth
+services. In those cases, review the error message together with service
+configuration and dependency health.
+
+The public Go wrappers combine errors so callers can classify the operation
+without depending on message text. One error can identify the operation, the
+NATS phase, and the domain cause. For example, after \texttt{Emergency.Start}, a
+client can check:
+
+\begin{lstlisting}
+errors.Is(err, domain.ErrEmergencyStart)
+errors.Is(err, domain.ErrNATSResponse)
+errors.Is(err, domain.ErrEmergencyStillRunning)
+\end{lstlisting}
+
+The main phase sentinels are \texttt{ErrNATSRequest},
+\texttt{ErrNATSResponse}, \texttt{ErrNATSSubscription}, and
+\texttt{ErrNATSPublish}. Operation sentinels identify calls such as
+\texttt{ErrAgentFindPath}, \texttt{ErrAgentCommStop}, or
+\texttt{ErrEmergencyFlowSub}.
+
+\subsection{Troubleshooting Guide}
+
+When a call fails or blocks, first review these operational points:
+
+\begin{description}
+\item[NATS connection.] Check that the NATS server is active, that
+\texttt{app.serverurl} matches the real address, and that the client uses the
+same server. Timeouts usually indicate that the service is not subscribed to the
+requested subject or that NATS is unreachable.
+\item[Objects in geotruth.] Verify that the agent identifier exists in geotruth
+before calling \texttt{AgentFindPath}. The service reads the agent's initial
+position from that system.
+\item[Images and execution directory.] Confirm that \texttt{grid.layers.img}
+paths exist from the directory where the process is launched. A path that works
+from the repository may fail from another directory.
+\item[Grid dimensions and scale.] Review \texttt{rows}, \texttt{cols},
+\texttt{pxpercell}, and \texttt{cellsizem} when the route does not match the
+real space. Use \texttt{pkg/tuning} before deployment to render the grid and
+detect scale or wall-rasterization problems.
+\item[Cell coordinates versus rows and columns.] Internal grid coordinates are
+written as \texttt{X,Y}, where \texttt{X} is the column and \texttt{Y} is the
+row. Printed output and visualizers are usually read as row-column, so a cell
+observed as \texttt{(row, column)} must be converted to
+\texttt{(X: column, Y: row)} before multiplying by \texttt{cellsizem}.
+\item[Floors and regions.] If a coordinate \texttt{[x, y, z]} does not resolve
+to the expected floor, review the external system that translates real points
+to regions and the names defined in \texttt{grid.layers}. Floor names must be
+consistent between service configuration and geotruth.
+\item[Portals between floors.] In multi-floor environments, check that each
+portal joins traversable cells, source and destination layer indexes exist, and
+the traversal cost is positive. A badly placed portal can make an inter-floor
+route impossible even if each floor is traversable by itself.
+\item[Route not found.] For \texttt{ErrAgentNoPath}, inspect whether the exit or
+goal is inside a blocked zone, dynamic obstacles closed the only available
+connection, or the rasterized grid isolated the initial cell.
+\item[Blocking calls.] \texttt{BlockingWait} and \texttt{MoveFMeters} can wait
+until the session ends or the agent consumes the requested distance. If many
+simultaneous calls are made for different agents, review
+\texttt{pathfinding.agent.blockingwaithandlerworkers} and
+\texttt{pathfinding.agent.movefmetershandlerworkers}. These values only limit
+NATS handlers; they do not change route calculation or command ordering for a
+single agent.
+\end{description}
+
+\end{document}

@@ -1,0 +1,483 @@
+pathfinding:
+  agent:
+    #sparsevaluepagedirectory: true
+grid:
+  cellsizem: 0.2
+  rows: 403
+  cols: 1010
+  pxpercell: 1.6
+  wallauracells: 2
+  layers:
+    - name: "0"
+      img: "../../data/hospital/plan1RED.png"
+    - name: "1"
+      img: "../../data/hospital/plan2RED.png"
+    - name: "2"
+      img: "../../data/hospital/plan3RED.png"
+    - name: "3"
+      img: "../../data/hospital/plan4RED.png"
+    - name: "4"
+      img: "../../data/hospital/plan5RED.png"
+  portals:
+    # Portal coordinates are meters, ordered as [x, y]; traversalcost is the cross-floor penalty.
+    # Stairs 0-1
+    ## Top-left stair
+    - from: [12.4, 9.8]
+      fromlayer: 0
+      to: [12.4, 5]
+      tolayer: 1
+      traversalcost: 100
+      bidirectional: true
+    - from: [12.4, 10.8]
+      fromlayer: 0
+      to: [12.4, 7]
+      tolayer: 1
+      traversalcost: 100
+      bidirectional: true
+    ## Bottom-left stair
+    - from: [12.4, 78]
+      fromlayer: 0
+      to: [12, 73.4]
+      tolayer: 1
+      traversalcost: 100
+      bidirectional: true
+    - from: [12.4, 78.8]
+      fromlayer: 0
+      to: [12, 75]
+      tolayer: 1
+      traversalcost: 100
+      bidirectional: true
+    ## Top-right stair
+    - from: [187.8, 10]
+      fromlayer: 0
+      to: [185.8, 4.6]
+      tolayer: 1
+      traversalcost: 100
+      bidirectional: true
+    - from: [187.8, 10.8]
+      fromlayer: 0
+      to: [185.8, 6.6]
+      tolayer: 1
+      traversalcost: 100
+      bidirectional: true
+     ## Bottom-right stair
+    - from: [187.8, 78]
+      fromlayer: 0
+      to: [185.8, 74]
+      tolayer: 1
+      traversalcost: 100
+      bidirectional: true
+    - from: [187.8, 78.8]
+      fromlayer: 0
+      to: [185.8, 75.6]
+      tolayer: 1
+      traversalcost: 100
+      bidirectional: true
+
+    # Stairs 1-2
+    ## Top-left stair
+    - from: [12.4, 9.8]
+      fromlayer: 1
+      to: [12.4, 5]
+      tolayer: 2
+      traversalcost: 100
+      bidirectional: true
+    - from: [12.4, 10.8]
+      fromlayer: 1
+      to: [12.4, 7]
+      tolayer: 2
+      traversalcost: 100
+      bidirectional: true
+    ## Bottom-left stair
+    - from: [12.4, 78]
+      fromlayer: 1
+      to: [12, 73.4]
+      tolayer: 2
+      traversalcost: 100
+      bidirectional: true
+    - from: [12.4, 78.8]
+      fromlayer: 1
+      to: [12, 75]
+      tolayer: 2
+      traversalcost: 100
+      bidirectional: true
+    ## Top-right stair
+    - from: [187.8, 10]
+      fromlayer: 1
+      to: [185.8, 4.6]
+      tolayer: 2
+      traversalcost: 100
+      bidirectional: true
+    - from: [187.8, 10.8]
+      fromlayer: 1
+      to: [185.8, 6.6]
+      tolayer: 2
+      traversalcost: 100
+      bidirectional: true
+     ## Bottom-right stair
+    - from: [187.8, 78]
+      fromlayer: 1
+      to: [185.8, 74]
+      tolayer: 2
+      traversalcost: 100
+      bidirectional: true
+    - from: [187.8, 78.8]
+      fromlayer: 1
+      to: [185.8, 75.6]
+      tolayer: 2
+      traversalcost: 100
+      bidirectional: true
+
+    # Stairs 2-3
+    ## Top-left stair
+    - from: [12.4, 9.8]
+      fromlayer: 2
+      to: [12.4, 5]
+      tolayer: 3
+      traversalcost: 100
+      bidirectional: true
+    - from: [12.4, 10.8]
+      fromlayer: 2
+      to: [12.4, 7]
+      tolayer: 3
+      traversalcost: 100
+      bidirectional: true
+    ## Bottom-left stair
+    - from: [12.4, 78]
+      fromlayer: 2
+      to: [12, 73.4]
+      tolayer: 3
+      traversalcost: 100
+      bidirectional: true
+    - from: [12.4, 78.8]
+      fromlayer: 2
+      to: [12, 75]
+      tolayer: 3
+      traversalcost: 100
+      bidirectional: true
+    ## Top-right stair
+    - from: [187.8, 10]
+      fromlayer: 2
+      to: [185.8, 4.6]
+      tolayer: 3
+      traversalcost: 100
+      bidirectional: true
+    - from: [187.8, 10.8]
+      fromlayer: 2
+      to: [185.8, 6.6]
+      tolayer: 3
+      traversalcost: 100
+      bidirectional: true
+     ## Bottom-right stair
+    - from: [187.8, 78]
+      fromlayer: 2
+      to: [185.8, 74]
+      tolayer: 3
+      traversalcost: 100
+      bidirectional: true
+    - from: [187.8, 78.8]
+      fromlayer: 2
+      to: [185.8, 75.6]
+      tolayer: 3
+      traversalcost: 100
+      bidirectional: true
+
+    # Stairs 3-4
+    ## Top-left stair
+    - from: [12.4, 9.8]
+      fromlayer: 3
+      to: [12.4, 5]
+      tolayer: 4
+      traversalcost: 100
+      bidirectional: true
+    - from: [12.4, 10.8]
+      fromlayer: 3
+      to: [12.4, 7]
+      tolayer: 4
+      traversalcost: 100
+      bidirectional: true
+    ## Bottom-left stair
+    - from: [12.4, 78]
+      fromlayer: 3
+      to: [12, 73.4]
+      tolayer: 4
+      traversalcost: 100
+      bidirectional: true
+    - from: [12.4, 78.8]
+      fromlayer: 3
+      to: [12, 75]
+      tolayer: 4
+      traversalcost: 100
+      bidirectional: true
+    ## Top-right stair
+    - from: [187.8, 10]
+      fromlayer: 3
+      to: [185.8, 4.6]
+      tolayer: 4
+      traversalcost: 100
+      bidirectional: true
+    - from: [187.8, 10.8]
+      fromlayer: 3
+      to: [185.8, 6.6]
+      tolayer: 4
+      traversalcost: 100
+      bidirectional: true
+     ## Bottom-right stair
+    - from: [187.8, 78]
+      fromlayer: 3
+      to: [185.8, 74]
+      tolayer: 4
+      traversalcost: 100
+      bidirectional: true
+    - from: [187.8, 78.8]
+      fromlayer: 3
+      to: [185.8, 75.6]
+      tolayer: 4
+      traversalcost: 100
+      bidirectional: true
+
+    # Elevators
+    ## First
+    - from: [78.8, 42.8]
+      fromlayer: 0
+      to: [78.8, 42.8]
+      tolayer: 1
+      traversalcost: 500
+      bidirectional: true
+    - from: [78.8, 42.8]
+      fromlayer: 0
+      to: [78.8, 42.8]
+      tolayer: 2
+      traversalcost: 520
+      bidirectional: true
+    - from: [78.8, 42.8]
+      fromlayer: 0
+      to: [78.8, 42.8]
+      tolayer: 3
+      traversalcost: 540
+      bidirectional: true
+    - from: [78.8, 42.8]
+      fromlayer: 0
+      to: [78.8, 42.8]
+      tolayer: 4
+      traversalcost: 560
+      bidirectional: true
+    - from: [78.8, 42.8]
+      fromlayer: 1
+      to: [78.8, 42.8]
+      tolayer: 2
+      traversalcost: 500
+      bidirectional: true
+    - from: [78.8, 42.8]
+      fromlayer: 1
+      to: [78.8, 42.8]
+      tolayer: 3
+      traversalcost: 520
+      bidirectional: true
+    - from: [78.8, 42.8]
+      fromlayer: 1
+      to: [78.8, 42.8]
+      tolayer: 4
+      traversalcost: 540
+      bidirectional: true
+    - from: [78.8, 42.8]
+      fromlayer: 2
+      to: [78.8, 42.8]
+      tolayer: 3
+      traversalcost: 500
+      bidirectional: true
+    - from: [78.8, 42.8]
+      fromlayer: 2
+      to: [78.8, 42.8]
+      tolayer: 4
+      traversalcost: 520
+      bidirectional: true
+    - from: [78.8, 42.8]
+      fromlayer: 3
+      to: [78.8, 42.8]
+      tolayer: 4
+      traversalcost: 500
+      bidirectional: true
+    ## Second
+    - from: [88.2, 42.8]
+      fromlayer: 0
+      to: [88.2, 42.8]
+      tolayer: 1
+      traversalcost: 500
+      bidirectional: true
+    - from: [88.2, 42.8]
+      fromlayer: 0
+      to: [88.2, 42.8]
+      tolayer: 2
+      traversalcost: 520
+      bidirectional: true
+    - from: [88.2, 42.8]
+      fromlayer: 0
+      to: [88.2, 42.8]
+      tolayer: 3
+      traversalcost: 540
+      bidirectional: true
+    - from: [88.2, 42.8]
+      fromlayer: 0
+      to: [88.2, 42.8]
+      tolayer: 4
+      traversalcost: 560
+      bidirectional: true
+    - from: [88.2, 42.8]
+      fromlayer: 1
+      to: [88.2, 42.8]
+      tolayer: 2
+      traversalcost: 500
+      bidirectional: true
+    - from: [88.2, 42.8]
+      fromlayer: 1
+      to: [88.2, 42.8]
+      tolayer: 3
+      traversalcost: 520
+      bidirectional: true
+    - from: [88.2, 42.8]
+      fromlayer: 1
+      to: [88.2, 42.8]
+      tolayer: 4
+      traversalcost: 540
+      bidirectional: true
+    - from: [88.2, 42.8]
+      fromlayer: 2
+      to: [88.2, 42.8]
+      tolayer: 3
+      traversalcost: 500
+      bidirectional: true
+    - from: [88.2, 42.8]
+      fromlayer: 2
+      to: [88.2, 42.8]
+      tolayer: 4
+      traversalcost: 520
+      bidirectional: true
+    - from: [88.2, 42.8]
+      fromlayer: 3
+      to: [88.2, 42.8]
+      tolayer: 4
+      traversalcost: 500
+      bidirectional: true
+    ## Third
+    - from: [110.2, 42.8]
+      fromlayer: 0
+      to: [110.2, 42.8]
+      tolayer: 1
+      traversalcost: 500
+      bidirectional: true
+    - from: [110.2, 42.8]
+      fromlayer: 0
+      to: [110.2, 42.8]
+      tolayer: 2
+      traversalcost: 520
+      bidirectional: true
+    - from: [110.2, 42.8]
+      fromlayer: 0
+      to: [110.2, 42.8]
+      tolayer: 3
+      traversalcost: 540
+      bidirectional: true
+    - from: [110.2, 42.8]
+      fromlayer: 0
+      to: [110.2, 42.8]
+      tolayer: 4
+      traversalcost: 560
+      bidirectional: true
+    - from: [110.2, 42.8]
+      fromlayer: 1
+      to: [110.2, 42.8]
+      tolayer: 2
+      traversalcost: 500
+      bidirectional: true
+    - from: [110.2, 42.8]
+      fromlayer: 1
+      to: [110.2, 42.8]
+      tolayer: 3
+      traversalcost: 520
+      bidirectional: true
+    - from: [110.2, 42.8]
+      fromlayer: 1
+      to: [110.2, 42.8]
+      tolayer: 4
+      traversalcost: 540
+      bidirectional: true
+    - from: [110.2, 42.8]
+      fromlayer: 2
+      to: [110.2, 42.8]
+      tolayer: 3
+      traversalcost: 500
+      bidirectional: true
+    - from: [110.2, 42.8]
+      fromlayer: 2
+      to: [110.2, 42.8]
+      tolayer: 4
+      traversalcost: 520
+      bidirectional: true
+    - from: [110.2, 42.8]
+      fromlayer: 3
+      to: [110.2, 42.8]
+      tolayer: 4
+      traversalcost: 500
+      bidirectional: true
+    ## Forth
+    - from: [119.4, 42.8]
+      fromlayer: 0
+      to: [119.4, 42.8]
+      tolayer: 1
+      traversalcost: 500
+      bidirectional: true
+    - from: [119.4, 42.8]
+      fromlayer: 0
+      to: [119.4, 42.8]
+      tolayer: 2
+      traversalcost: 520
+      bidirectional: true
+    - from: [119.4, 42.8]
+      fromlayer: 0
+      to: [119.4, 42.8]
+      tolayer: 3
+      traversalcost: 540
+      bidirectional: true
+    - from: [119.4, 42.8]
+      fromlayer: 0
+      to: [119.4, 42.8]
+      tolayer: 4
+      traversalcost: 560
+      bidirectional: true
+    - from: [119.4, 42.8]
+      fromlayer: 1
+      to: [119.4, 42.8]
+      tolayer: 2
+      traversalcost: 500
+      bidirectional: true
+    - from: [119.4, 42.8]
+      fromlayer: 1
+      to: [119.4, 42.8]
+      tolayer: 3
+      traversalcost: 520
+      bidirectional: true
+    - from: [119.4, 42.8]
+      fromlayer: 1
+      to: [119.4, 42.8]
+      tolayer: 4
+      traversalcost: 540
+      bidirectional: true
+    - from: [119.4, 42.8]
+      fromlayer: 2
+      to: [119.4, 42.8]
+      tolayer: 3
+      traversalcost: 500
+      bidirectional: true
+    - from: [119.4, 42.8]
+      fromlayer: 2
+      to: [119.4, 42.8]
+      tolayer: 4
+      traversalcost: 520
+      bidirectional: true
+    - from: [119.4, 42.8]
+      fromlayer: 3
+      to: [119.4, 42.8]
+      tolayer: 4
+      traversalcost: 500
+      bidirectional: true

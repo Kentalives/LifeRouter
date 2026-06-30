@@ -1,0 +1,1746 @@
+\documentclass[12pt,a4paper]{report}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[english]{babel}
+\usepackage{array}
+\usepackage{float}
+\usepackage{geometry}
+\usepackage{longtable}
+\usepackage{listings}
+\usepackage{fvextra}
+\usepackage{csquotes}
+\usepackage[hyphens]{url}
+\usepackage[hidelinks,breaklinks=true]{hyperref}
+
+\geometry{margin=2.5cm}
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{0.6em}
+\renewcommand{\arraystretch}{1.2}
+
+\lstset{
+  basicstyle=\small\ttfamily,
+  breaklines=true,
+  breakatwhitespace=false,
+  columns=fullflexible,
+  frame=single
+}
+
+\title{LifeRouter\\Technical Manual}
+\author{Kentalives}
+\date{June 2026}
+
+\begin{document}
+
+\pagenumbering{roman}
+\maketitle
+\setcounter{page}{2}
+\tableofcontents
+\clearpage
+\pagenumbering{arabic}
+
+\chapter{Technical Manual}
+
+This manual contains the information needed to modify, test, and maintain LifeRouter.
+ The user manual describes installation, configuration,
+and use of the public API. This document focuses on the internal code structure,
+package dependencies, service lifecycle, and the points where developers must be
+careful before introducing changes.
+
+\section{Internal System Organization}
+
+The project is a Go module that combines a public API for integrations, an
+executable entry point for running the service as a standalone process, and an
+\texttt{internal/} tree reserved for implementation code. This separation matters
+because external consumers can import public packages, while internal packages
+must only be used by this module.
+
+\begin{table}[H]
+\centering
+\begin{tabular}{|p{0.31\textwidth}|p{0.60\textwidth}|}
+\hline
+\textbf{Path} & \textbf{Main responsibility} \\
+\hline
+\texttt{main.go} &
+Standalone process entry point. It loads configuration, creates the default
+dependencies, runs the dispatcher, and waits for system shutdown signals. \\
+\hline
+\texttt{embedded/} &
+Public surface for running the service inside another Go process. It exposes
+default configuration, default dependency wiring, and the startup call that
+delegates to the same application path as the binary. \\
+\hline
+\texttt{pkg/config} &
+Public configuration and dependency-injection types. Changes to these types can
+break external repositories that build custom configurations. \\
+\hline
+\texttt{pkg/domain} &
+Exported domain types: costs, visualization states, emergency directions,
+registered NATS-domain errors, and geospatial query or publishing interfaces. \\
+\hline
+\texttt{pkg/pathfinding} and \texttt{pkg/emergency} &
+Go clients over NATS for starting agent routes, controlling communicators, and
+managing emergency routing. They do not own the NATS connection they receive. \\
+\hline
+\texttt{pkg/subjects} &
+Public constants for the NATS subjects handled by the service. They allow direct
+NATS use without duplicating string literals in Go consumers. \\
+\hline
+\texttt{pkg/}\newline\texttt{snapshotstream} &
+Shared codec for per-floor snapshots sent through NATS streams. It preserves the
+simple shape for small messages and chunks large snapshots with
+\texttt{gzip+json}. \\
+\hline
+\texttt{pkg/tuning} &
+Public helper tools for inspecting rasterized maps and tuning the grid before
+running the service, including textual output and a browser visualizer for large
+grids. \\
+\hline
+\end{tabular}
+\caption{Executable entry point and public API responsibilities.}
+\end{table}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{|p{0.31\textwidth}|p{0.60\textwidth}|}
+\hline
+\textbf{Path} & \textbf{Main responsibility} \\
+\hline
+\texttt{internal/app} &
+Application wiring, world initialization, NATS dispatcher, request handlers,
+active-agent state, and emergency lifecycle. \\
+\hline
+\texttt{internal/config} &
+Configuration loading with Viper, default values, and process-wide storage for
+configuration and dependencies used by internal packages. \\
+\hline
+\texttt{internal/grid} and \texttt{internal/raster} &
+Grid representation, coordinates, multi-floor world, portals, and conversion
+from map images into traversal costs. \\
+\hline
+\texttt{internal/pathfinding} &
+Algorithm implementations: shared primitives, dynamic agent planning, and
+emergency flow fields. \\
+\hline
+\texttt{internal/mock}, \texttt{internal/} \newline \texttt{pathfinding/testing}, and
+\texttt{internal/integration} &
+Test doubles, shared scenarios, and global behavior tests for the service. \\
+\hline
+\texttt{data/} &
+Map images used as inputs in tests and rasterization tuning. \\
+\hline
+\end{tabular}
+\caption{Internal implementation packages and supporting data.}
+\end{table}
+
+\subsection{Boundary Between Public API and Implementation}
+
+The public boundary is formed by \texttt{embedded/} and \texttt{pkg/}. The
+\texttt{embedded} package lets another Go application run the service in its own
+process through \texttt{DefaultConfig}, \newline \texttt{DefaultDependencies}, and
+\texttt{Run}. This path is useful for integrations, tools, and debugging runs,
+but it still requires a NATS connection and domain dependencies that are
+coherent with the real environment.
+
+The \texttt{pkg/} directory contains the types and clients that other
+repositories can use. The \texttt{pkg/pathfinding} and \texttt{pkg/emergency}
+packages translate Go calls into NATS requests. \texttt{pkg/config} defines
+configuration and injectable dependencies. \texttt{pkg/domain} contains shared
+types such as costs, directions, preferred-route graphs, and domain errors.
+\newline \texttt{pkg/subjects} exposes NATS subject constants for consumers that build
+messages directly. When this surface changes, both internal tests and possible
+external integrations must be considered.
+
+By contrast, \texttt{internal/} must not be treated as a stable API. It contains
+global application state, algorithms, and communication details. A change inside
+\texttt{internal/} may legitimately avoid external compatibility, but it must
+preserve the behavior observed through the public API and NATS subjects.
+
+\subsection{Service Lifecycle}
+
+The standalone process and the embedded mode use the same application path. The
+main difference is who creates the configuration, dependencies, and cancellation
+context.
+
+\begin{table}[H]
+\centering
+\begin{tabular}{|p{0.24\textwidth}|p{0.67\textwidth}|}
+\hline
+\textbf{Phase} & \textbf{Technical description} \\
+\hline
+Initial load &
+\texttt{main.go} creates a context cancellable by \texttt{SIGINT} or
+\texttt{SIGTERM}, calls \texttt{config.LoadConfig}, and obtains values from
+defaults, \texttt{config/config.yaml}, and environment variables. \\
+\hline
+Default dependencies &
+\texttt{embedded.DefaultDependencies} opens separate NATS connection pools for
+geospatial queries and publishing, and prepares a simulated external system.
+Production deployments can provide their own dependencies through
+\texttt{pkg/config.Dependencies}. \\
+\hline
+Application startup &
+\texttt{app.Run} stores global configuration and dependencies, initializes
+logging, builds the rasterized world with layers and portals, creates the
+service NATS connection, and registers handlers. \\
+\hline
+Normal execution &
+The \texttt{Dispatcher} keeps active agent communicators, briefly retains
+completed agent results, and manages the current emergency state. Blocking
+request paths use worker limits to avoid unbounded goroutine growth. \\
+\hline
+Graceful shutdown &
+\texttt{Dispatcher.Shutdown} stops active agents, stops the emergency if one is
+running, drains the service NATS connection, cancels the service context, and
+closes dependency resources that expose \texttt{Close}. \\
+\hline
+\end{tabular}
+\caption{Main lifecycle phases of the microservice.}
+\end{table}
+
+\subsection{Dependency Model}
+
+Internal packages access configuration and dependencies through
+\texttt{internal/config}. This simplifies access from algorithms and handlers,
+but it requires service startup to call \texttt{config.Setup} before code that
+reads \texttt{config.Cfg} or \texttt{config.Dep}. Tests that exercise internal
+packages must explicitly prepare this state when they call functions that depend
+on it.
+
+\begin{table}[H]
+\centering
+\begin{tabular}{|p{0.34\textwidth}|p{0.58\textwidth}|}
+\hline
+\textbf{Element} & \textbf{Use inside the system} \\
+\hline
+\texttt{pkg/config.Config} &
+Complete configuration: NATS connection, logging, grid dimensions, layers,
+portals, agent parameters, emergency parameters, and geotruth pool sizes. \\
+\hline
+\texttt{pkg/config.Dependencies} &
+Groups the external systems required for domain data, geospatial reads, and
+movement publishing. \\
+\hline
+\texttt{domain.ExternalSystem} &
+Provides information not owned by pathfinding: object costs, floor heights, and
+emergency signaling nodes. \\
+\hline
+\texttt{domain.GeoQuery} &
+Read-side geospatial interface: nearby objects, object data, oriented object
+sets, and floor/region lookup for a real-world point. \\
+\hline
+\texttt{domain.GeoPublish} &
+Write-side interface used to publish an agent's new position and receive the
+external commit acknowledgement. \\
+\hline
+\end{tabular}
+\caption{Configuration and external dependencies used by the application.}
+\end{table}
+
+\subsection{Geotruth Connection Pools}
+
+The default dependencies wrap \texttt{GeoQuery} and \texttt{GeoPublish} in
+internal NATS client pools. The query pool is used for object data, nearby
+objects, oriented objects, and floor resolution. The publish pool is used for
+position updates. Separating both flows avoids making local agent vision and
+real-position publishing always compete for the same NATS connection.
+
+Pool sizes are configured under \texttt{pathfinding.geotruth} through
+\texttt{queryconnections} and \texttt{publishconnections}. If omitted, both
+default to \texttt{GOMAXPROCS}; values lower than one are normalized to one
+connection. Client selection uses round-robin atomic counters. During shutdown,
+\texttt{Dispatcher.Shutdown} closes dependencies that implement \texttt{Close},
+including the pools created by \texttt{DefaultDependencies}.
+
+\subsection{NATS Handler Ownership}
+
+The concrete NATS subjects are documented in the user manual and defined as
+public constants in \texttt{pkg/subjects}. For maintenance, the important point
+is which dispatcher area owns each handler group and which internal state it
+changes.
+
+\begin{table}[H]
+\centering
+\begin{tabular}{|p{0.28\textwidth}|p{0.63\textwidth}|}
+\hline
+\textbf{Group} & \textbf{Internal responsibility} \\
+\hline
+Agent pathfinding &
+Starts planning for an existing object, converts the goal from meters to grid
+coordinates, creates an internal \texttt{AgentCommunicator}, and replaces any
+previous run for the same agent. \\
+\hline
+Agent path observation &
+Associates a state-publishing channel with the active communicator and streams
+snapshots until the route ends or the communicator closes the channel. \\
+\hline
+Agent communicator control &
+Checks movement state, waits for completion, changes speed, requests discrete or
+meter-based movement, pauses automatic movement, or terminates the route. \\
+\hline
+Emergency pathfinding &
+Applies preferred routes to the global world, converts goals to grid
+coordinates, starts the flow field, and prevents simultaneous emergencies. \\
+\hline
+Emergency flow observation &
+Publishes per-floor direction maps while an emergency is active and closes the
+subscription when the flow publisher finishes. \\
+\hline
+Emergency stop and shutdown &
+Coordinates emergency shutdown, waits for completion, and restores global costs
+when preferred routes are removed. \\
+\hline
+\end{tabular}
+\caption{NATS handler groups and associated internal state.}
+\end{table}
+
+\subsection{Validation Points for Changes}
+
+Changes to public APIs or NATS messages must be reviewed together with the user
+manual because they alter the integration contract. Changes to the dispatcher or
+lifecycle should run the \texttt{internal/app} tests and integration tests.
+Changes to grid logic, rasterization, or algorithms require the corresponding
+unit tests and, if performance is affected, the profiling or benchmark tests
+already separated in the repository.
+
+The general validation command is:
+
+\begin{lstlisting}
+make test
+\end{lstlisting}
+
+During local iteration, run the package-level tests first. Before closing a
+change, run the full suite. When measuring code exercised by all tests across
+packages, use the full coverage target described in the testing section.
+
+\section{Spatial Representation: Grid, Rasterization, and Multi-Floor World}
+
+The spatial representation is shared by agent pathfinding and emergency routing.
+The service does not work directly on continuous geometry. It works on a
+per-floor cost grid. Public API coordinates arrive in meters; before algorithms
+run, those coordinates are converted to cells and associated with a world layer.
+
+\subsection{Units and Coordinates}
+
+Internal local coordinates use \texttt{grid.Coords}, which contains integer
+\texttt{X} and \texttt{Y} cell indexes. Conversion between meters and cells
+depends on \texttt{GridConfig.CellSizeM}. Cell-to-meter conversion returns the
+cell center. Meter-to-cell conversion rounds toward the corresponding cell and
+never returns negative coordinates.
+
+\begin{table}[H]
+\centering
+\begin{tabular}{|p{0.34\textwidth}|p{0.58\textwidth}|}
+\hline
+\textbf{Element} & \textbf{Behavior to preserve} \\
+\hline
+\texttt{CellSizeM} &
+Real-world side length represented by one cell. It must be greater than zero;
+invalid global configuration causes the grid package to panic. \\
+\hline
+\texttt{Coords.ToFloat64} &
+Converts cell indexes to meters and returns the center of the cell. It is the
+reference for publishing or comparing real positions derived from the grid. \\
+\hline
+\texttt{CoordsFromFloat64} &
+Converts an \texttt{x,y} meter position to a cell coordinate using active
+configuration and clamps negative coordinates to zero. \\
+\hline
+\texttt{GlobalCoords} &
+Adds a layer index to a local coordinate, distinguishing the same \texttt{x,y}
+cell on different floors. \\
+\hline
+\texttt{GlobalCoordsFromFloat64} &
+Uses \texttt{GeoQuery.RegionFromPoint} to resolve the layer and then converts
+\texttt{x,y} to a cell. It requires \texttt{config.Dep.Qu} to be initialized. \\
+\hline
+\end{tabular}
+\caption{Main units and conversions in the spatial representation.}
+\end{table}
+
+Global coordinates must be validated before converting them to flattened
+indexes. A cell whose \texttt{X} or \texttt{Y} is outside its floor cannot rely
+on \texttt{ToIdx}, because arithmetic could alias another floor's index range.
+The intended exception is the emergency fake goal, represented as a sentinel
+outside the grid with flattened index \texttt{-1}.
+
+\subsection{Grid Cost Layers}
+
+Each \texttt{Grid} keeps three same-size buffers. The base layer comes from the
+rasterized map and floor masks. The object layer represents dynamic costs, such
+as obstacles or observed agents. The final layer is the effective cost read by
+the algorithms. This separation keeps the base map stable while updating only
+regions affected by dynamic information.
+
+\begin{table}[H]
+\centering
+\begin{tabular}{|p{0.31\textwidth}|p{0.61\textwidth}|}
+\hline
+\textbf{Concept} & \textbf{Behavior to preserve} \\
+\hline
+\texttt{base} &
+Permanent floor costs. A zero value blocks a cell and must not be overwritten by
+ordinary dynamic updates. \\
+\hline
+\texttt{objects} &
+Temporary costs added by objects or local updates. A zero-cost object region can
+clear previous temporary costs and restore the base cost. \\
+\hline
+\texttt{final} &
+Cost used by pathfinding. It is recomputed with \texttt{AddCost(base, objects)}
+and change notifications are emitted when it changes. \\
+\hline
+\texttt{RegionGrid} &
+Rectangular region relative to a parent grid. It is used to replace object
+costs, apply base masks, and limit updates around a position. \\
+\hline
+\texttt{SubChanges} &
+Registers synchronous callbacks for batches of changed cells. Updates must
+preserve notification of previous costs. \\
+\hline
+\texttt{AddCost} and \texttt{DiagonalCost} &
+Cost operations that are safe around unreachable values and overflow. Algorithms
+must use these helpers rather than adding costs directly. \\
+\hline
+\end{tabular}
+\caption{Internal grid layers and related operations.}
+\end{table}
+
+Main mutation points are object-region replacement, base-mask application,
+final-cost recomputation, and base reset. Any change here must preserve blocked
+cells, publish each batch of changes once, and keep base, object, and final
+layers synchronized. A future extension could page the local object and final
+layers, similar to the sparse storage already used for D* Lite values.
+
+\subsection{Map Rasterization}
+
+World creation calls \texttt{grid.FromImg}, which builds each floor base layer
+through \newline \texttt{raster.RasterPNG4WithAura}. \texttt{pxpercell} tells how many
+source image pixels correspond to one grid cell. Traversable cells are selected
+from the red channel: in simple paletted images, the red palette entry is used;
+in generic images, the average red value must pass the internal threshold. Wall
+aura then increases cost around blocked cells using a Chebyshev neighborhood.
+
+\begin{table}[H]
+\centering
+\begin{tabular}{|p{0.30\textwidth}|p{0.62\textwidth}|}
+\hline
+\textbf{Change point} & \textbf{Main risk} \\
+\hline
+Image format handling &
+Changing palette detection or fallback behavior can make existing maps
+non-traversable or unexpectedly expensive. \\
+\hline
+Pixel-to-cell sampling &
+Changing center sampling or scaling rules can move walls and corridors relative
+to the configured grid. \\
+\hline
+Wall aura &
+Changing the Chebyshev radius or cost can close narrow corridors or remove
+clearance around walls. \\
+\hline
+Base-cost convention &
+Changing empty-space and unreachable values affects all grid and pathfinding
+cost calculations. \\
+\hline
+\end{tabular}
+\caption{Rasterization risks that require explicit validation.}
+\end{table}
+
+\subsection{Multi-Floor World, Portals, and Virtual Worlds}
+
+\texttt{World} groups floor grids and stores metadata that flattens global
+coordinates into unique indexes. Layer names are translated to internal indexes
+through the configured \newline \texttt{GridConfig.FloorLayers}. Geotruth region names
+must match these configured names when public \texttt{[x,y,z]} coordinates are
+converted into layers.
+
+Portals are directed cross-floor edges. Global portals are configured during
+startup. Local portals belong only to a leased virtual world and are useful for
+agent-specific changes. The world stores portals indexed by origin and by
+destination, so \texttt{PortalsFrom} and \texttt{PortalsTo} do not need to scan
+unrelated portals.
+
+\begin{table}[H]
+\centering
+\begin{tabular}{|p{0.32\textwidth}|p{0.60\textwidth}|}
+\hline
+\textbf{Element} & \textbf{Role} \\
+\hline
+\texttt{NewWorld} &
+Rasterizes configured layers, installs the process-wide global world, and later
+receives configured portals. \\
+\hline
+\texttt{NewVirtualWorld} &
+Leases a per-agent world that lazily links floors from the global world and keeps
+local portals separate. \\
+\hline
+\texttt{AddPortal} and \texttt{AddBidirectionalPortal} &
+Add directed or paired global cross-floor edges. Invalid costs, same-floor
+portals, and invalid endpoints are rejected or logged. \\
+\hline
+\texttt{AddLocalPortal} &
+Adds a portal visible only in the leased virtual world, preserving the global
+world for other agents and for emergency routing. \\
+\hline
+\texttt{PortalsFrom} and \texttt{PortalsTo} &
+Merge global and local portals from the corresponding origin or destination
+indexes. \\
+\hline
+\end{tabular}
+\caption{Multi-floor world elements and portal responsibilities.}
+\end{table}
+
+\subsection{Validation of Spatial Changes}
+
+Spatial changes must be validated at the layer they affect: coordinate
+conversion, grid costs, rasterization, portals, or virtual-world reuse.
+
+\begin{table}[H]
+\centering
+\begin{tabular}{|p{0.31\textwidth}|p{0.61\textwidth}|}
+\hline
+\textbf{Change} & \textbf{Minimum validation} \\
+\hline
+Coordinate conversion &
+Tests for meter-to-cell and cell-to-meter conversion, negative coordinates,
+configured cell size, and layer resolution. \\
+\hline
+Cost-layer mutation &
+Tests that blocked base cells remain blocked, final costs update correctly, and
+subscribers receive changed cells. \\
+\hline
+Rasterization &
+Tests with representative map fixtures, aura radius, complex-image fallback, and
+red-channel threshold behavior. \\
+\hline
+Portals &
+Unit tests for directed and bidirectional portals, same-floor rejection,
+incoming-portal lookup, removal, and virtual-world local portals. \\
+\hline
+Virtual-world reuse &
+Tests that reused worlds do not leak local portals, subscriptions, or dynamic
+objects from a previous agent run. \\
+\hline
+\end{tabular}
+\caption{Recommended validation for spatial changes.}
+\end{table}
+
+\section{Agent Pathfinding With D* Lite}
+
+Agent routing is based on D* Lite \cite{koenig-likhachev-dstar-lite}. The
+planner controls movement, local geotruth vision, dynamic cost updates, and
+route publication. Each route runs in a goroutine and owns a virtual world
+derived from the global world.
+
+\subsection{Lifecycle of an Agent Route}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{|p{0.26\textwidth}|p{0.65\textwidth}|}
+\hline
+\textbf{Phase} & \textbf{Description} \\
+\hline
+Request reception &
+The dispatcher decodes \texttt{AgentFindPathParams}, checks shutdown state,
+converts the goal to \texttt{GlobalCoords}, and starts internal agent
+pathfinding. \\
+\hline
+Initial state &
+The agent position is read from geotruth, converted to grid coordinates, and
+associated with a leased virtual world. \\
+\hline
+Planning &
+D* Lite initializes values, priority queue state, and the current goal; it then
+computes the shortest path from the current position. \\
+\hline
+Movement loop &
+While the start is not the goal, the communicator decides whether a step can be
+taken based on speed, manual commands, and termination signals. \\
+\hline
+Local update &
+Nearby objects are queried from geotruth, rasterized into local grid overlays,
+and changed cells trigger D* Lite repairs. \\
+\hline
+Real publication &
+According to \texttt{CellsForRealUpdate}, internal position is converted to
+meters and published with \texttt{GeoPublish.UpdateObjectPosition}; floor height
+is read from \texttt{ExternalSystem.HeightAtFloorPoint}. \\
+\hline
+Completion &
+The communicator records the terminal error, closes publishers and waiters,
+releases the virtual world, and the dispatcher retains the result briefly. \\
+\hline
+\end{tabular}
+\caption{Agent route lifecycle.}
+\end{table}
+
+\subsection{D* Lite State}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{|p{0.28\textwidth}|p{0.64\textwidth}|}
+\hline
+\textbf{State} & \textbf{Role} \\
+\hline
+\texttt{g} and \texttt{rhs} &
+The D* Lite value pair. Dense mode uses one contiguous store; sparse mode
+allocates value pages only where needed. \\
+\hline
+Priority queue &
+Queue with lookup, update, and removal by index. Keys encode D* Lite priority
+and depend on the current start. \\
+\hline
+\texttt{start} and \texttt{goal} &
+The current position is stored as coordinates; the goal is stored as a flattened
+global index. \\
+\hline
+World subscription &
+Receives changed cells from the virtual world and transforms them into D* Lite
+vertex updates. \\
+\hline
+Portal state &
+Successor and predecessor expansion must include same-floor neighbors and
+cross-floor portals. \\
+\hline
+\end{tabular}
+\caption{Main state used by the agent D* Lite planner.}
+\end{table}
+
+The sentinel index \texttt{-1} is reserved for the emergency fake goal and must
+not be treated as a normal agent pathfinding cell.
+
+\subsection{Local Vision and Dynamic Changes}
+
+Agent replanning is driven by local observations. The planner asks geotruth for
+nearby objects inside the configured vision radius converted to meters. Object
+geometry is rasterized into the agent's virtual-world object layers. Changed
+cells are then propagated to D* Lite, which repairs only the affected parts of
+the search state. This conversion follows a scanline-style rasterization
+strategy commonly used to fill geometry over pixel or cell grids
+\cite{foley1995computergraphics,pineda1988polygon}.
+
+\begin{table}[H]
+\centering
+\begin{tabular}{|p{0.31\textwidth}|p{0.61\textwidth}|}
+\hline
+\textbf{Element} & \textbf{Meaning} \\
+\hline
+\texttt{VisionRadiusCells} &
+Radius of local geotruth refresh in grid cells; it is also converted to meters
+for the external query. \\
+\hline
+\texttt{SparseValuePageDirectory} &
+Enables sparse storage for D* Lite \texttt{g/rhs} values in large local worlds. \\
+\hline
+Object rasterization &
+Converts oriented objects into dynamic grid costs using object traversal costs
+from the external system. \\
+\hline
+Changed-cell repair &
+Updates predecessor and successor costs so D* Lite can reuse previous search
+work instead of planning from scratch. \\
+\hline
+\end{tabular}
+\caption{Configuration and dependencies used by agent local vision.}
+\end{table}
+
+\subsection{Communicator and Movement Control}
+
+The \texttt{AgentCommunicator} connects public commands, internal route state,
+and goroutine lifecycle. It must maintain the ordering of commands for one agent;
+worker limits in NATS handlers do not parallelize one agent's algorithm.
+
+\begin{table}[H]
+\centering
+\begin{tabular}{|p{0.30\textwidth}|p{0.62\textwidth}|}
+\hline
+\textbf{Responsibility} & \textbf{Behavior} \\
+\hline
+\texttt{UpdateMovementSpeed} &
+Changes continuous movement speed in cells per second. A zero value pauses
+automatic movement without terminating the job. \\
+\hline
+\texttt{MoveNCells} &
+Requests a bounded number of grid-cell steps. \\
+\hline
+\texttt{MoveFMeters} &
+Blocks until the requested distance in meters is consumed or the agent exits; it
+returns remaining meters when the request cannot be fully consumed. \\
+\hline
+\texttt{Stop} &
+Pauses automatic movement by setting speed to zero. \\
+\hline
+\texttt{Terminate} &
+Cancels the route and stores \texttt{ErrAgentTerminated} if it was still active. \\
+\hline
+\texttt{BlockingWait} and \texttt{ExitError} &
+Allow clients to wait for completion and query the terminal domain error. The
+dispatcher also supports these calls briefly after completion. \\
+\hline
+Path publisher &
+Streams route-visualization snapshots. Replacing a publisher closes the previous
+one. \\
+\hline
+\end{tabular}
+\caption{Agent communicator responsibilities.}
+\end{table}
+
+Automatic movement uses absolute next-tick scheduling. The communicator schedules
+the next movement instant before returning to route processing, so planning and
+publication time count against cadence. If a tick is already overdue, the
+implementation permits one immediate step and then resets timing from the current
+time rather than catching up with bursts.
+
+\subsection{Resource Ownership and Validation}
+
+An agent run owns its virtual world, local subscriptions, path publisher, wait
+channels, and terminal result. Changing this ownership can leave callbacks
+active, stale data in reused worlds, or terminal errors unavailable to clients.
+Use tests around replacement by a same-agent run, termination, retained results,
+and shutdown races whenever this area changes.
+
+\section{Emergency Routing With Flow Fields}
+
+Emergency routing computes a global flow field toward one or more exits. The
+flow field is updated when the environment changes and can be mapped to
+emergency signaling nodes. Unlike agent routing, this uses the global world
+because preferred routes intentionally modify global base costs and are restored
+when the emergency stops.
+
+\subsection{Emergency Lifecycle}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{|p{0.27\textwidth}|p{0.64\textwidth}|}
+\hline
+\textbf{Phase} & \textbf{Behavior} \\
+\hline
+Start request &
+The dispatcher checks that no emergency is already running, applies preferred
+routes, converts goals from meters to grid coordinates, and starts the flow
+field. \\
+\hline
+Initialization &
+The emergency planner validates goals, prepares light-node state, adds the fake
+goal sentinel, and subscribes to world changes. \\
+\hline
+Initial computation &
+The planner computes the global flow directions for all reachable cells. \\
+\hline
+Periodic update &
+At the configured tick rate, environment objects are refreshed, changed cells
+are applied, the D* Lite state is repaired, and flow snapshots are published
+when requested. \\
+\hline
+Signaling update &
+Light nodes are updated when cost changes exceed the lighting hysteresis and a
+dominant direction is selected from local neighborhood directions. \\
+\hline
+Stop &
+The dispatcher closes the emergency quit channel, waits for completion, removes
+preferred-route masks, and marks the emergency as stopped. \\
+\hline
+\end{tabular}
+\caption{Emergency routing lifecycle.}
+\end{table}
+
+\subsection{Flow-Field State}
+
+The emergency planner reuses D* Lite ideas, but its output is a direction per
+cell rather than one agent route. The fake goal connects all exits to a single
+sentinel, making every reachable cell point toward a suitable exit. Directions
+include eight planar directions and portal transitions \texttt{DIR\_IN} and
+\texttt{DIR\_OUT}.
+
+\begin{table}[H]
+\centering
+\begin{tabular}{|p{0.31\textwidth}|p{0.61\textwidth}|}
+\hline
+\textbf{State} & \textbf{Role} \\
+\hline
+Fake goal &
+Sentinel outside the real grid used as a common target for all emergency exits. \\
+\hline
+Direction map &
+Per-floor arrays of \texttt{domain.Direction} values sent through
+\texttt{FlowSub}. \\
+\hline
+World subscription &
+Tracks changed cells and queues signaling nodes whose local flow may need
+refreshing. \\
+\hline
+\texttt{flowPublisher} &
+Single publisher for emergency flow snapshots. A new subscription replaces the
+previous publisher. \\
+\hline
+\end{tabular}
+\caption{Main state of the emergency flow field.}
+\end{table}
+
+\subsection{Environment Updates and Signaling}
+
+Before computing or updating the flow field, \texttt{applyEnvironmentObjects}
+queries all oriented objects and refreshes object layers for all floors. Each
+floor uses the region linked to that layer, clears previous object costs,
+rasterizes relevant objects, and calls \texttt{UpdateFinal}. Changed cells are
+registered by the world's subscription.
+
+\begin{table}[H]
+\centering
+\begin{tabular}{|p{0.32\textwidth}|p{0.60\textwidth}|}
+\hline
+\textbf{Parameter or dependency} & \textbf{Emergency effect} \\
+\hline
+\texttt{LightingHystheresis} &
+Minimum cost-change threshold before a signaling node direction is updated. \\
+\hline
+\texttt{PriorityPathCellsWidth} &
+Width, in grid cells, used to rasterize preferred routes onto the grid. \\
+\hline
+\texttt{AllObjectsOriented} &
+Source of the objects used to refresh dynamic costs on all floors. \\
+\hline
+\texttt{SignalingSetDirection} &
+External operation that writes the selected direction into a signaling node. \\
+\hline
+\texttt{updateTicksPerSecond} &
+Frequency at which the emergency goroutine refreshes the environment, repairs
+planning state, and publishes changes when needed. \\
+\hline
+\end{tabular}
+\caption{Configuration and dependencies relevant to emergency routing.}
+\end{table}
+
+\subsection{Preferred Routes and Restoration}
+
+Preferred routes arrive as per-floor graphs. \texttt{ApplyPreferencePaths}
+searches the waypoints of each edge and rasterizes a line on the corresponding
+floor grid. This line applies a negative mask to the base layer so the flow field
+favors those corridors. Malformed edges with missing waypoints are ignored. If
+an edge omits its weight, the implementation uses the default value \texttt{1}.
+
+When the emergency stops, \texttt{RemovePreferencePaths} calls
+\texttt{ResetBase} on every floor to restore normal traversable-space cost while
+keeping object layers current. Restoration must happen both on ordinary stop and
+during service shutdown.
+
+\begin{table}[H]
+\centering
+\begin{tabular}{|p{0.32\textwidth}|p{0.60\textwidth}|}
+\hline
+\textbf{Responsibility} & \textbf{Code path} \\
+\hline
+Apply preferred routes &
+The start handler calls \texttt{ApplyPreferencePaths} before creating the flow
+field. \\
+\hline
+Remove routes after startup error &
+If goal conversion or initialization fails, the handler removes preference masks
+before returning the error. \\
+\hline
+Remove routes on stop &
+\texttt{completeEmergencyStopLocked} calls \texttt{RemovePreferencePaths} and
+marks the emergency stopped. \\
+\hline
+Remove routes during shutdown &
+\texttt{stopCurrentEmergency} joins the emergency goroutine and performs the same
+cleanup even if shutdown races with a client stop request. \\
+\hline
+\end{tabular}
+\caption{Emergency cleanup responsibilities.}
+\end{table}
+
+\subsection{Validation of Emergency Changes}
+
+Emergency changes should cover startup, blocked goals, simultaneous start
+rejection, flow publication, object updates, signaling, preferred routes, and
+ordered stop. If a change affects signaling, include tests for hysteresis,
+direction selection, and missing or invalid nodes.
+
+\section{Public API, NATS Subjects, and Dispatcher}
+
+The public API has two equivalent views: typed Go wrappers and raw NATS
+messages. The wrappers live in \texttt{pkg/pathfinding} and
+\texttt{pkg/emergency}; the raw subject names live in \texttt{pkg/subjects}. The
+dispatcher owns the NATS subscriptions and translates messages into internal
+grid, world, communicator, and flow-field operations.
+
+\subsection{Boundary Between Public Clients and Internal Handlers}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{|p{0.29\textwidth}|p{0.29\textwidth}|p{0.32\textwidth}|}
+\hline
+\textbf{Public operation} & \textbf{Internal payload or handler} &
+\textbf{Internal effect} \\
+\hline
+\texttt{Pathfinding.} \newline \texttt{AgentFindPath} &
+\texttt{AgentFindPathParams} &
+Converts goal, creates an agent communicator, and registers it in the dispatcher. \\
+\hline
+\texttt{Pathfinding.} \newline \texttt{AgentNaivePathCost} &
+\texttt{AgentNaivePath-} \newline \texttt{CostParams} &
+Computes cost without creating movement state. \\
+\hline
+\texttt{Pathfinding.} \newline \texttt{AgentPathSub} &
+\texttt{IdentifierParams} and \texttt{snapshotstream.} \newline
+\texttt{Envelope} &
+Streams route cell states through the request reply subject. \\
+\hline
+\texttt{Emergency.Start} &
+\texttt{EmergencyPathParams} &
+Applies preferred routes, validates goals, starts the flow field, and updates
+emergency lifecycle state. \\
+\hline
+\texttt{Emergency.FlowSub} &
+\texttt{snapshotstream.} \newline \texttt{Envelope} &
+Streams emergency direction maps per floor. \\
+\hline
+\end{tabular}
+\caption{Public operations and internal dispatcher paths.}
+\end{table}
+
+\subsection{Subject Registration and Concurrency}
+
+\texttt{app.Run} subscribes all public subjects. Most handlers execute directly
+on NATS callbacks. \texttt{AgentFindPath}, \texttt{BlockingWait}, and
+\texttt{MoveFMeters} are wrapped by bounded worker handlers because they can
+block long enough to occupy the callback path.
+
+\begin{table}[H]
+\centering
+\begin{tabular}{|p{0.29\textwidth}|p{0.23\textwidth}|p{0.38\textwidth}|}
+\hline
+\textbf{Subject group} & \textbf{Worker limit} & \textbf{Reason} \\
+\hline
+\texttt{pathfinding.} \newline \texttt{agent\_find\_path} &
+\texttt{findpath-} \newline \texttt{handlerworkers} &
+Route initialization can block while preparing the pathfinding run. \\
+\hline
+\texttt{agent\_comm.} \newline \texttt{blocking\_wait} &
+\texttt{blockingwait-} \newline \texttt{handlerworkers} &
+The request waits until an agent completes. \\
+\hline
+\texttt{agent\_comm.} \newline \texttt{move\_f\_meters} &
+\texttt{movefmeters-} \newline \texttt{handlerworkers} &
+The request waits until a distance is consumed or the route ends. \\
+\hline
+Other request subjects &
+No extra worker wrapper &
+They are expected to finish quickly or stream through a separate goroutine. \\
+\hline
+\end{tabular}
+\caption{NATS handler concurrency model.}
+\end{table}
+
+\subsection{Agent Session Lifecycle}
+
+A new \texttt{AgentFindPath} call for an agent replaces the previous run for
+that same identifier. The old communicator is terminated. Completed results are
+retained for a short interval so \texttt{IsMoving}, \texttt{BlockingWait}, and
+\texttt{ExitError} can still respond after the active communicator has left the
+dispatcher table. During shutdown, \texttt{stopActiveAgents} prevents new
+registrations, terminates all active communicators, waits for them, and clears
+the tables.
+
+\subsection{Subscription Flows}
+
+Path and flow subscriptions use request/reply setup but stream multiple messages
+to the reply subject. The handler returns immediately and a goroutine owns the
+reply stream. Messages contain \texttt{done=false} while data continues and a
+final \texttt{done=true} message before the channel closes.
+
+Small snapshots keep the legacy envelope:
+
+\begin{lstlisting}
+{"done": false, "cells": {"0": [0, 1, 4]}}
+\end{lstlisting}
+Large snapshots use the shared \texttt{pkg/snapshotstream} codec. The service
+serializes the per-floor map, compresses it with \texttt{gzip}, and publishes a
+sequence of chunk envelopes:
+
+\begin{lstlisting}
+{
+  "encoding": "gzip+json",
+  "snapshotId": "42",
+  "chunkIndex": 0,
+  "chunkCount": 3,
+  "data": "..."
+}
+\end{lstlisting}
+
+\texttt{chunkIndex} is zero-based within one \texttt{snapshotId}. Because
+\texttt{data} is a Go \texttt{[]byte} encoded as JSON, non-Go clients must first
+base64-decode that field for each chunk. Consumers then join all chunks for the
+same snapshot, decompress the combined payload, and decode the JSON as the same
+per-floor map otherwise carried by \texttt{cells}. The Go wrappers use
+\texttt{snapshotstream.Assembler} and expose only reconstructed snapshots on
+\texttt{AgentPathSub} and \texttt{FlowSub}. Service handlers should use
+\texttt{snapshotstream.MarshalSnapshot} for data messages and
+\texttt{snapshotstream.MarshalDone} for terminal messages.
+
+Replacing an agent path publisher closes the previous publisher for that
+communicator. Replacing the emergency flow publisher closes the previous global
+flow publisher. Clients must be ready for stream closure and should resubscribe
+if they need to become the active observer again.
+
+\subsection{Public Errors}
+
+Domain errors are registered with the shared message package so raw NATS clients
+can receive stable error codes. Go wrappers additionally wrap failures with
+operation and NATS-phase sentinels such as \texttt{ErrNATSRequest},
+\texttt{ErrNATSResponse}, \texttt{ErrNATSSubscription}, and
+\texttt{ErrNATSPublish}.
+
+\begin{table}[H]
+\centering
+\begin{tabular}{|p{0.36\textwidth}|p{0.55\textwidth}|}
+\hline
+\textbf{Public error} & \textbf{Typical situation} \\
+\hline
+\texttt{ErrAgentCommNotFound} &
+A communicator operation references an identifier without an active or retained
+session. \\
+\hline
+\texttt{ErrAgentNoPath} &
+No traversable route exists from the current agent position to the goal. \\
+\hline
+\texttt{ErrAgentTerminated} &
+The route was explicitly terminated. \\
+\hline
+\texttt{ErrAgentStillRunning} &
+\texttt{ExitError} was queried while the route is still active. \\
+\hline
+\texttt{ErrAgentExitedWithMetersLeft} &
+A meter movement request could not consume the full requested distance because
+the route ended first. \\
+\hline
+\texttt{ErrEmergencyStillRunning} &
+An emergency start was requested while another emergency was active or stopping. \\
+\hline
+\texttt{ErrDispatcherShuttingDown} &
+The dispatcher is draining and no longer accepts new agent registrations. \\
+\hline
+\end{tabular}
+\caption{Domain errors that are part of the public API.}
+\end{table}
+
+\subsection{Validation of Public API Changes}
+
+When adding or changing public API behavior, update all related contracts
+together: subject constants, payload type, dispatcher handler, Go wrapper,
+integration tests, and user manual. Include malformed-payload or missing-session
+cases for handlers that accept external input.
+
+\section{Configuration and Embedded Execution}
+
+Configuration affects both the standalone executable and embedded execution. It
+defines NATS connectivity, logging, grid shape, layers, portals, handler worker
+limits, geotruth pool sizes, and algorithm parameters.
+
+\subsection{Configuration Sources}
+
+\texttt{main.go} calls \texttt{LoadConfig(nil)}. This creates a Viper instance,
+registers defaults from \texttt{DefaultConfig}, loads
+\texttt{config/config.yaml}, and allows \texttt{PTHFSERVICE\_*} environment
+variables to override keys. Tests, tools, and benchmarks can pass an explicit
+YAML path.
+
+\begin{table}[H]
+\centering
+\begin{tabular}{|p{0.28\textwidth}|p{0.22\textwidth}|p{0.39\textwidth}|}
+\hline
+\textbf{Source} & \textbf{Precedence} & \textbf{Use} \\
+\hline
+\texttt{DefaultConfig} &
+Lowest &
+Provides local defaults for NATS, grid, maps, algorithm parameters, and worker
+limits. \\
+\hline
+\texttt{config/config.yaml} or explicit path &
+Middle &
+Project or scenario configuration. \\
+\hline
+\texttt{PTHFSERVICE\_*} &
+Highest &
+Operational override. Dotted keys become underscores, for example
+\texttt{PTHFSERVICE\_APP\_SERVERURL}. \\
+\hline
+\end{tabular}
+\caption{Configuration sources and precedence.}
+\end{table}
+
+\subsection{Public Configuration Structure}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{|p{0.28\textwidth}|p{0.63\textwidth}|}
+\hline
+\textbf{Type} & \textbf{Responsibility} \\
+\hline
+\texttt{AppConfig} &
+NATS URL and logging destinations. \\
+\hline
+\texttt{GridConfig} &
+Layers, portals, rows, columns, pixels per cell, meters per cell, and wall aura. \\
+\hline
+\texttt{PathfindingConfig} &
+Shared free-movement height plus the agent, emergency, and geotruth blocks. \\
+\hline
+\texttt{AgentConfig} &
+Vision radius, real-position update cadence, reusable-world limit, sparse value
+storage, NATS worker limits, and debug output. \\
+\hline
+\texttt{EmergencyConfig} &
+Signaling hysteresis, preferred-route width in cells, and debug output. \\
+\hline
+\texttt{GeotruthConfig} &
+Internal NATS connection pool sizes for geotruth queries and publishes. \\
+\hline
+\end{tabular}
+\caption{Public configuration groups.}
+\end{table}
+
+\subsection{Dependency Injection}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{|p{0.23\textwidth}|p{0.31\textwidth}|p{0.36\textwidth}|}
+\hline
+\textbf{Field} & \textbf{Interface} & \textbf{Purpose} \\
+\hline
+\texttt{Ex} &
+\texttt{ExternalSystem} &
+Object traversal costs, floor heights, and emergency signaling operations. \\
+\hline
+\texttt{Qu} &
+\texttt{GeoQuery} &
+Object data, local vision, all oriented objects, and floor/region lookup. \\
+\hline
+\texttt{Pu} &
+\texttt{GeoPublish} &
+Movement publication and commit acknowledgement for real object positions. \\
+\hline
+\end{tabular}
+\caption{Injected dependencies and subsystem use.}
+\end{table}
+
+\texttt{DefaultDependencies} is useful for local runs and tests because it
+creates geotruth NATS pools and a simulated \texttt{ExternalSystem}. In a real
+installation, the integrator should provide implementations that match the
+deployment's geotruth and signaling services.
+
+\subsection{Standalone and Embedded Execution}
+
+The standalone executable and embedded API converge in \texttt{app.Run}. In
+standalone mode, \texttt{main.go} loads the file, creates default dependencies,
+and waits for OS signals. In embedded mode, the caller constructs
+\texttt{Config}, supplies dependencies, calls \texttt{embedded.Run}, and later
+calls \texttt{Shutdown} on the returned dispatcher.
+
+\begin{table}[H]
+\centering
+\begin{tabular}{|p{0.25\textwidth}|p{0.30\textwidth}|p{0.35\textwidth}|}
+\hline
+\textbf{Responsibility} & \textbf{Standalone} & \textbf{Embedded} \\
+\hline
+Configuration &
+\texttt{LoadConfig(nil)} from \texttt{config/config.yaml}. &
+Caller can use defaults, explicit load, or construct a configuration. \\
+\hline
+Dependencies &
+\texttt{embedded.} \newline \texttt{DefaultDependencies}. &
+Caller should usually provide production dependencies. \\
+\hline
+Lifecycle &
+OS signal triggers shutdown. &
+Caller owns cancellation and must call \texttt{Shutdown}. \\
+\hline
+\end{tabular}
+\caption{Standalone and embedded execution responsibilities.}
+\end{table}
+
+\subsection{Validation of Configuration Changes}
+
+For a new configuration key, add the public field, \texttt{mapstructure} tag,
+default value, documentation, and tests for defaults, YAML loading, and
+environment override. If the value affects runtime behavior, add a functional
+test in the subsystem that consumes it.
+
+\section{External Integrations and Test Doubles}
+
+The pathfinding service depends on external systems but keeps them behind small
+interfaces. Internal packages should not create real external clients by
+themselves. They receive dependencies prepared by the standalone startup,
+embedded API, or tests.
+
+\subsection{Dependency Contracts}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{|p{0.22\textwidth}|p{0.28\textwidth}|p{0.40\textwidth}|}
+\hline
+\textbf{Contract} & \textbf{Primary users} & \textbf{Notes} \\
+\hline
+\texttt{ExternalSystem} &
+Agent movement, emergency signaling, object costs. &
+Must propagate errors with enough context to diagnose external failures. \\
+\hline
+\texttt{GeoQuery} &
+Coordinate conversion, agent local vision, emergency object refresh. &
+Region names returned by \texttt{RegionFromPoint} must match configured layer
+names. \\
+\hline
+\texttt{GeoPublish} &
+Agent real-position publishing. &
+Returns a commit acknowledgement. Resource ownership belongs to the concrete
+implementation or the pool that wraps it. \\
+\hline
+\end{tabular}
+\caption{External dependency contracts.}
+\end{table}
+
+\subsection{Use by Subsystem}
+
+Agent planning uses \texttt{GeoQuery.ObjectData}, \texttt{RegionFromPoint},
+\texttt{NearbyObjectsOf}, \newline \texttt{ObjectTraversalCost},
+\texttt{HeightAtFloorPoint}, and \texttt{GeoPublish.UpdateObjectPosition}.
+Emergency routing uses \texttt{AllObjectsOriented}, \texttt{LightNodeRegex}, and
+\newline \texttt{SignalingSetDirection}. Startup resolves the available signaling nodes
+once when the dispatcher is created.
+
+\subsection{Embedded Execution and Real Services}
+
+Embedded execution can be used with the default dependencies or with real
+services. The default dependency path still connects to NATS and creates
+geotruth query/publish pools, but it uses a simulated external system for domain
+costs and signaling. For production, provide dependencies that implement the
+public interfaces and close any external resources they own.
+
+\subsection{Test Doubles}
+
+\texttt{internal/mock} provides test doubles for the domain and geotruth parts
+needed by the service. They are used for unit, component, integration, and
+performance tests where deterministic behavior is more important than full
+external-system fidelity.
+
+\begin{table}[H]
+\centering
+\begin{tabular}{|p{0.25\textwidth}|p{0.36\textwidth}|p{0.29\textwidth}|}
+\hline
+\textbf{Double} & \textbf{Simulated behavior} & \textbf{Main use} \\
+\hline
+\texttt{mock.GeoTruth} &
+In-memory object store, lookup by ID, local object queries, and oriented object
+sets. &
+Agent and emergency tests. \\
+\hline
+\texttt{mock.ExternalSystem} &
+Object traversal costs, floor heights, and signaling methods. &
+Algorithm and integration tests. \\
+\hline
+\texttt{internal/} \newline \texttt{pathfinding/testing} scenarios &
+Reusable map and route cases. &
+Black-box pathfinding behavior. \\
+\hline
+\end{tabular}
+\caption{Main test doubles and scenarios.}
+\end{table}
+
+\section{System Extension and Technical Limits}
+
+The system supports local changes, but some resources are process-wide:
+configuration, dependencies, and the global world. An extension must not
+initialize unrelated worlds or modify global configuration while agents or
+emergencies are active unless it also defines and tests a new synchronization
+strategy.
+
+\subsection{Extension Points}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{|p{0.23\textwidth}|p{0.34\textwidth}|p{0.32\textwidth}|}
+\hline
+\textbf{Extension} & \textbf{Contracts to update} & \textbf{Minimum validation} \\
+\hline
+New NATS subject or public operation &
+\texttt{pkg/subjects}, dispatcher payload, handler registration, Go wrapper,
+and user manual. &
+Integration test, invalid-payload case, and public-error review. \\
+\hline
+Snapshot stream envelope &
+\texttt{pkg/snapshotstream}, dispatcher publication helpers, Go stream
+assemblers, raw-NATS documentation, and user manual. &
+Codec tests plus public \texttt{AgentPathSub} and \texttt{FlowSub} round trips
+for chunked snapshots. \\
+\hline
+New agent communicator command &
+Public method, subject, handler, internal communicator method, and behavior for
+finished or missing agents. &
+Tests with active agent, terminated agent, cancellation, and post-completion
+calls. \\
+\hline
+New configuration parameter &
+Public field, \texttt{mapstructure} tag, default, file/env loading, and
+documentation. &
+Configuration-load test and subsystem functional test. \\
+\hline
+New external dependency &
+Public interface method, real implementation, test double, and subsystem call. &
+Double-based test, error propagation test, and integration case when NATS or
+geotruth is involved. \\
+\hline
+New algorithm or search variant &
+Internal input boundary, state types, global-grid interaction, and result
+publication. &
+Algorithm unit tests, no-path cases, multi-floor cases if applicable, and public
+API test when externally observable. \\
+\hline
+\end{tabular}
+\caption{Main extension points and validation requirements.}
+\end{table}
+
+\subsection{Current Technical Limits}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{|p{0.27\textwidth}|p{0.31\textwidth}|p{0.31\textwidth}|}
+\hline
+\textbf{Limit} & \textbf{Current behavior} & \textbf{Implication} \\
+\hline
+Process-wide world &
+The global world and layer translation are shared. &
+Multiple independent worlds in one process require redesign. \\
+\hline
+Static signaling set &
+Light nodes are resolved when the dispatcher starts. &
+Nodes appearing or disappearing during an emergency are future work. \\
+\hline
+Grid-based movement &
+Public coordinates are meters, but algorithms operate on rasterized cells. &
+Precision and policy rules depend on grid resolution. \\
+\hline
+Preferred-route restoration &
+Emergency preferred routes modify global base costs and are reset on stop. &
+Unexpected shutdown paths must preserve cleanup. \\
+\hline
+Per-agent local world &
+Agents copy or link local dynamic state per route. &
+Large maps and many agents may require paging or higher-level guidance. \\
+\hline
+\end{tabular}
+\caption{Current technical limits and their design intent.}
+\end{table}
+
+\subsection{Checklist Before Accepting an Extension}
+
+Before accepting a shared change, identify whether it affects configuration,
+grid/rasterization, algorithms, public API, external integrations, or lifecycle.
+Then confirm documentation, tests, and public wrappers are updated together. If
+a limitation remains, document it here or in the project conclusions rather than
+letting it remain implicit.
+
+\section{Tests, Benchmarks, and Technical Validation}
+
+The repository uses Go's \texttt{testing} package. Tests live beside the
+packages they exercise, with additional integration-style tests under
+\texttt{internal/integration} and shared behavior scenarios under
+\texttt{internal/pathfinding/testing}. Heavy diagnostics and benchmarks are kept
+separate from ordinary tests.
+
+\subsection{Test Map by Responsibility}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{|p{0.24\textwidth}|p{0.31\textwidth}|p{0.33\textwidth}|}
+\hline
+\textbf{Area} & \textbf{Typical packages} & \textbf{Purpose} \\
+\hline
+Grid and raster &
+\texttt{internal/grid}, \texttt{internal/raster}, \texttt{pkg/tuning} &
+Coordinate conversion, cost layers, image rasterization, wall aura, portals,
+subscriptions, and visualization helpers. \\
+\hline
+Agent algorithm &
+\texttt{internal/} \newline \texttt{pathfinding/agent} &
+D* Lite behavior, local changes, movement, communicator commands, and
+multi-floor paths. \\
+\hline
+Emergency algorithm &
+\texttt{internal/} \newline \texttt{pathfinding/emergency} &
+Flow-field planning, preferred routes, signaling, environment updates, and stop
+cleanup. \\
+\hline
+Public API &
+\texttt{pkg/pathfinding}, \texttt{pkg/emergency}, \texttt{internal/app},
+\texttt{internal/integration} &
+NATS request/response behavior, wrappers, errors, lifecycle, and shutdown. \\
+\hline
+Configuration and embedded &
+\texttt{internal/config}, \texttt{embedded}, integration tests &
+Default values, YAML loading, environment overrides, embedded startup, and
+dependency cleanup. \\
+\hline
+\end{tabular}
+\caption{Test responsibilities by subsystem.}
+\end{table}
+
+\subsection{Unit and Component Tests}
+
+Unit tests validate small, deterministic behavior: priority queues, raster
+primitives, grid cost math, coordinate conversion, portal lookup, paged value
+storage, and public wrapper error classification. Component tests exercise
+larger behavior such as D* Lite replanning, agent communicators, flow-field
+updates, and dispatcher shutdown.
+
+\subsection{API Boundary Error Tests}
+
+The API tests include representative malformed JSON, missing communicator,
+dispatcher-shutdown, emergency-already-running, idempotent stop, and post-agent
+completion cases. The goal is scenario-driven validation, not duplicating every
+malformed payload variant for every subject.
+
+\subsection{Public API Integration Tests}
+
+Integration tests start NATS and the service path, then use public clients or raw
+subjects to validate observable behavior. They check direct routes, multi-floor
+routes, subscriptions, movement commands, emergency start/stop, and error
+propagation through the same public surface that external consumers use.
+
+\subsection{Benchmarks and Heavy Tests}
+
+Benchmarks are used for diagnosis and scalability evidence. Ordinary benchmarks
+measure local structures or algorithms. Heavy benchmarks require explicit
+environment variables and should be run only when evaluating capacity or
+full-stack behavior.
+
+\begin{table}[H]
+\centering
+\begin{tabular}{|p{0.27\textwidth}|p{0.30\textwidth}|p{0.31\textwidth}|}
+\hline
+\textbf{Benchmark group} & \textbf{Focus} & \textbf{Use} \\
+\hline
+Grid/raster benchmarks &
+Map loading, portal lookup, world creation. &
+After changing rasterization or world data structures. \\
+\hline
+Agent benchmarks &
+D* Lite planning, local cost updates, movement capacity. &
+After changing agent planning, movement cadence, or virtual worlds. \\
+\hline
+Emergency benchmarks &
+Flow-field planning, object refresh, preferred-route application. &
+After changing emergency recomputation or signaling behavior. \\
+\hline
+API capacity benchmarks &
+NATS wrappers, handler workers, geotruth pool settings. &
+When evaluating full-stack concurrency. \\
+\hline
+\end{tabular}
+\caption{Benchmark groups and when to use them.}
+\end{table}
+
+Typical heavy benchmark commands include:
+
+\begin{Verbatim}[breaklines=true,fontsize=\small]
+$env:PATHFINDING_BENCH_HEAVY='1'; go test ./internal/performance -run ^$ -bench BenchmarkSynthetic_AgentCapacity -benchtime=1x -count=7 -benchmem
+$env:PATHFINDING_BENCH_HEAVY='1'; $env:PATHFINDING_BENCH_REAL='1'; go test ./internal/performance -run ^$ -bench BenchmarkReal_AgentCapacity -benchtime=1x -count=7 -benchmem
+$env:PATHFINDING_BENCH_HEAVY='1'; go test ./internal/pathfinding/emergency -run ^$ -bench BenchmarkFlowfield_MovingObjectsCapacity -benchtime=1x -count=7 -benchmem
+\end{Verbatim}
+
+When using \texttt{-count=7}, summarize latency with the median and treat a point
+as stable only when all seven runs satisfy the benchmark criterion. Partial
+success should be described as unstable, not as guaranteed capacity.
+
+Agent capacity benchmarks distinguish \texttt{RawStep}, \texttt{ExternalTick},
+and \texttt{RealTime}. \newline \texttt{ExternalTick} best represents simulations whose
+clock is controlled by another system: agents start stopped, external ticks ask
+each active agent to move a meter distance, and leftover distance is accumulated.
+\texttt{RealTime} measures autonomous movement where the service controls
+cadence.
+
+Emergency moving-object capacity measures a synchronous emergency tick: read
+oriented objects, rasterize them, apply changed cells, and repair the flow field.
+The main axis is \texttt{moving\_objects}; \texttt{p95\_tick\_ms} is compared
+with the target tick budget, while \texttt{missed\_ticks} remains diagnostic.
+
+\subsection{Coverage, Execution, and Change Validation}
+
+The main validation command is:
+
+\begin{lstlisting}
+make test
+\end{lstlisting}
+
+This target runs \texttt{go test} with verbose output, local package coverage,
+and \texttt{coverage.out}. Local coverage shows what each package's own tests
+exercise, but it does not attribute code executed by tests from other packages.
+For complete cross-package coverage, use:
+
+\begin{lstlisting}
+make test-cover-full
+\end{lstlisting}
+
+This target runs all module tests with \texttt{-coverpkg=./...} and produces
+\texttt{coverage-full.out}. Standard Go coverage tools can open both profiles.
+
+\begin{table}[H]
+\centering
+\begin{tabular}{|p{0.28\textwidth}|p{0.28\textwidth}|p{0.31\textwidth}|}
+\hline
+\textbf{Validation type} & \textbf{Command} & \textbf{When to use it} \\
+\hline
+Full tests &
+\texttt{make test} &
+Before closing changes to algorithms, grid, API, configuration, or lifecycle. \\
+\hline
+Full coverage &
+\texttt{make test-cover-full} &
+When measuring all code exercised by any test in the module. \\
+\hline
+Specific package &
+\texttt{go test ./internal/...} or a specific package &
+During local iteration on a small area. \\
+\hline
+Local coverage HTML &
+\texttt{make cover-html} &
+After \texttt{make test}. \\
+\hline
+Cross-package coverage HTML &
+\texttt{make cover-full-html} &
+After \texttt{make test-cover-full}. \\
+\hline
+Benchmarks &
+\texttt{go test -bench=.} on the affected package &
+When changing data structures, rasterization, planning, or resource reuse. \\
+\hline
+\end{tabular}
+\caption{Recommended technical validation commands.}
+\end{table}
+
+\section{Maintenance, Diagnosis, and Operational Problems}
+
+Maintenance requires observing logs, external resources, and active route
+lifecycle together. Most visible API errors come from inconsistent
+configuration, unavailable NATS or geotruth, coordinates that do not map to the
+grid, missing layers, disconnected routes, or incomplete cleanup during stop.
+
+\subsection{Logs and Diagnosis}
+
+Internal logging uses a \texttt{[PATHFINDING]} prefix, date, time, and source
+file. Configuration chooses standard error, a file, both, or neither. Disabling
+all output can be useful for tests but makes production diagnosis difficult.
+
+\begin{table}[H]
+\centering
+\begin{tabular}{|p{0.25\textwidth}|p{0.32\textwidth}|p{0.32\textwidth}|}
+\hline
+\textbf{Area} & \textbf{Observable signal} & \textbf{First check} \\
+\hline
+Startup &
+Panic or error before subjects are registered. &
+Configuration, map paths, NATS URL, and default dependencies. \\
+\hline
+Rasterization &
+Complex-image warning or failure opening a map path. &
+Image path relative to the execution directory and configured dimensions. \\
+\hline
+Portals &
+Portal dropped because of invalid cost, endpoint, or same layer. &
+Cost, source/destination layers, and meter coordinates. \\
+\hline
+NATS API &
+Client timeout or no response. &
+Same NATS server, registered subject, and service startup logs. \\
+\hline
+Agents &
+Communicator error, no path, or real-position update failure. &
+Agent existence in geotruth, valid goal floor, connectivity, and publisher
+acknowledgement. \\
+\hline
+Emergency &
+Start failure, unchanged flow, or no signaling update. &
+Goals, preferred routes, light nodes, and oriented-object data. \\
+\hline
+\end{tabular}
+\caption{Initial diagnosis points by symptom.}
+\end{table}
+
+\subsection{Graceful Shutdown}
+
+Normal shutdown enters through \texttt{Shutdown}. In the standalone executable,
+this follows \texttt{SIGINT} or \texttt{SIGTERM}. In embedded mode, the caller
+must invoke it. The order matters because agent goroutines, emergency
+goroutines, publishers, and NATS subscriptions may be active simultaneously.
+
+\begin{table}[H]
+\centering
+\begin{tabular}{|p{0.27\textwidth}|p{0.29\textwidth}|p{0.31\textwidth}|}
+\hline
+\textbf{Phase} & \textbf{Resource} & \textbf{Risk if it fails} \\
+\hline
+Stop agents &
+Active communicators and retained results. &
+Blocked goroutines, movements after shutdown, or lost terminal results. \\
+\hline
+Stop emergency &
+Quit channel, done channel, preferred routes. &
+Base costs not restored or flow publisher left open. \\
+\hline
+Drain NATS &
+Dispatcher subscriptions and pending replies. &
+Clients miss final replies or callbacks run while state is being released. \\
+\hline
+Cancel context &
+Root service context. &
+Internal operations wait on already closed resources. \\
+\hline
+Close external resources &
+Connections, clients, or descriptors owned by dependencies. &
+Resource leaks in the embedding process. \\
+\hline
+\end{tabular}
+\caption{Relevant phases of graceful shutdown.}
+\end{table}
+
+\subsection{Common Problems}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{|p{0.27\textwidth}|p{0.31\textwidth}|p{0.30\textwidth}|}
+\hline
+\textbf{Problem} & \textbf{Likely cause} & \textbf{Initial action} \\
+\hline
+Timeout on a public call &
+NATS unreachable, subject not registered, or service not started. &
+Check URL, service startup, and subject registration logs. \\
+\hline
+Agent not found &
+Identifier missing in geotruth or completed result expired. &
+Verify object registration and distinguish agent ID from active session state. \\
+\hline
+No route &
+Goal outside grid, missing layer, walls without portals, or unreachable cost. &
+Check converted coordinates, layers, portals, and rasterized map. \\
+\hline
+Movement without real update &
+Publishing dependency failure or unsuitable update cadence. &
+Check \texttt{GeoPublish}, commit acknowledgement, floor height, and update
+configuration. \\
+\hline
+Emergency does not start &
+Another emergency is active, goal is invalid, or flow creation fails. &
+Check dispatcher emergency state, goals, and preferred-route restoration on
+failure. \\
+\hline
+Signaling does not change &
+Light nodes not resolved, hysteresis too high, or dominant direction unchanged. &
+Check node query, computed directions, and hysteresis. \\
+\hline
+\end{tabular}
+\caption{Common operational problems and first technical action.}
+\end{table}
+
+\subsection{Maintenance Checklist}
+
+Before changing a shared area, identify whether the change affects
+configuration, grid, algorithm, public API, or lifecycle. Then review external
+contracts and run the minimum validation for the affected subsystem.
+
+\begin{table}[H]
+\centering
+\begin{tabular}{|p{0.34\textwidth}|p{0.58\textwidth}|}
+\hline
+\textbf{Review} & \textbf{Criterion} \\
+\hline
+Effective configuration &
+The changed key has a default, file loading behavior, and documented effect. \\
+\hline
+External resources &
+Queries, publications, and external-system calls have timeouts and contextual
+errors. \\
+\hline
+Resource ownership &
+The owner of subscriptions, channels, worlds, publishers, and connections is
+clear. \\
+\hline
+Public compatibility &
+If an error, subject, JSON field, or public type changes, update the user manual
+and integration tests. \\
+\hline
+Diagnostic logs &
+Logs help locate failure phase without leaking sensitive data or flooding normal
+output. \\
+\hline
+Tests and benchmarks &
+Run subsystem validation and compare benchmarks before and after performance
+changes. \\
+\hline
+\end{tabular}
+\caption{Technical checklist before closing maintenance changes.}
+\end{table}
+
+\subsection{Validation After Incidents}
+
+A fixed incident should leave a reproducible test or check. Configuration
+failures need loading or invalid-value tests. Concurrency failures need tests for
+the observed race. Integration failures should exercise the public path that
+failed.
+
+\begin{table}[H]
+\centering
+\begin{tabular}{|p{0.34\textwidth}|p{0.58\textwidth}|}
+\hline
+\textbf{Incident} & \textbf{Recommended validation} \\
+\hline
+Startup error &
+Configuration or embedded-start test, plus logging check if the failure phase
+was unclear. \\
+\hline
+NATS timeout or error &
+Application or integration test confirming subject registration, response, and
+shutdown without pending goroutines. \\
+\hline
+Incorrect route &
+Algorithm unit test and integration test if the difference was visible through
+the public API. \\
+\hline
+Contaminated global state &
+Reuse or cleanup test for virtual worlds, local portals, preferred routes, or
+completed results. \\
+\hline
+Shutdown error &
+\texttt{Shutdown} test with active agents, active emergency, or simultaneous
+client stop. \\
+\hline
+Performance regression &
+Benchmark of the affected component with the same map and configuration before
+and after the correction. \\
+\hline
+\end{tabular}
+\caption{Recommended validation after operational incidents.}
+\end{table}
+
+\begin{thebibliography}{9}
+\addcontentsline{toc}{chapter}{Bibliography}
+
+\bibitem{koenig-likhachev-dstar-lite}
+S. Koenig and M. Likhachev, \enquote{D* Lite}, in \emph{Proceedings of the
+Eighteenth National Conference on Artificial Intelligence (AAAI-02)}, Edmonton,
+Alberta, Canada, 2002, pp. 476--483. Available:
+\url{https://cdn.aaai.org/AAAI/2002/AAAI02-072.pdf}. Accessed: June 15, 2026.
+
+\bibitem{foley1995computergraphics}
+J. D. Foley, A. van Dam, S. K. Feiner, and J. F. Hughes, \emph{Computer
+Graphics: Principles and Practice in C}, 2nd ed. Reading, MA, USA:
+Addison-Wesley, 1995.
+
+\bibitem{pineda1988polygon}
+J. Pineda, \enquote{A Parallel Algorithm for Polygon Rasterization}, \emph{ACM
+SIGGRAPH Computer Graphics}, vol. 22, no. 4, pp. 17--20, 1988, doi:
+10.1145/54852.378457.
+
+\end{thebibliography}
+
+\end{document}

@@ -1,0 +1,9 @@
+cff-version: 1.2.0
+title: "LifeRouter"
+message: "If you use this software, please cite it using the metadata from this file."
+authors:
+  - name: "Kentalives"
+    website: "https://github.com/Kentalives"
+repository-code: "https://github.com/Kentalives/LifeRouter"
+date-released: "2026-06-30"
+license: Apache-2.0
